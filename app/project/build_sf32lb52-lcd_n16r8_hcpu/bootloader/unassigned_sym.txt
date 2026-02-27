@@ -1,3 +1,3 @@
 RT_USING_MTD_NOR (defined at /Users/hiveton/HivetonCode/HivetonWodleXiaozhi/sdk//rtos/rtthread/components/drivers/Kconfig:122) was assigned the value 'y' but got the value 'n'. Check these unsatisfied dependencies: BSP_USING_RTTHREAD (=n). 
-BSP_ENABLE_MPI1 (defined at /Users/hiveton/HivetonCode/HivetonWodleXiaozhi/sdk//customer/boards/Kconfig_drv:689) was assigned the value 'y' but got the value 'n'. Check these unsatisfied dependencies: BSP_USING_MPI (=n). 
-BSP_ENABLE_MPI2 (defined at /Users/hiveton/HivetonCode/HivetonWodleXiaozhi/sdk//customer/boards/Kconfig_drv:780) was assigned the value 'y' but got the value 'n'. Check these unsatisfied dependencies: BSP_USING_MPI (=n). 
+BSP_ENABLE_MPI1 (defined at /Users/hiveton/HivetonCode/HivetonWodleXiaozhi/sdk//customer/boards/Kconfig_drv:704) was assigned the value 'y' but got the value 'n'. Check these unsatisfied dependencies: BSP_USING_MPI (=n). 
+BSP_ENABLE_MPI2 (defined at /Users/hiveton/HivetonCode/HivetonWodleXiaozhi/sdk//customer/boards/Kconfig_drv:795) was assigned the value 'y' but got the value 'n'. Check these unsatisfied dependencies: BSP_USING_MPI (=n). 

@@ -21,7 +21,6 @@
 /Users/hiveton/HivetonCode/HivetonWodleXiaozhi/sdk/customer/peripherals/rgb/Kconfig
 /Users/hiveton/HivetonCode/HivetonWodleXiaozhi/sdk/customer/peripherals/sensor/Kconfig
 /Users/hiveton/HivetonCode/HivetonWodleXiaozhi/sdk/customer/peripherals/vibrator/Kconfig
-/Users/hiveton/HivetonCode/HivetonWodleXiaozhi/sdk/customer/peripherals/wifi/Kconfig
 /Users/hiveton/HivetonCode/HivetonWodleXiaozhi/sdk/example/boot_loader/project/butterflmicro/ram_v2/Kconfig.proj
 /Users/hiveton/HivetonCode/HivetonWodleXiaozhi/sdk/external/CMSIS/Kconfig
 /Users/hiveton/HivetonCode/HivetonWodleXiaozhi/sdk/external/CmBacktrace-v1.3.0/Kconfig

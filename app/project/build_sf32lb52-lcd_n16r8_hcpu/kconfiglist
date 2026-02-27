@@ -22,7 +22,6 @@
 /Users/hiveton/HivetonCode/HivetonWodleXiaozhi/sdk/customer/peripherals/rgb/Kconfig
 /Users/hiveton/HivetonCode/HivetonWodleXiaozhi/sdk/customer/peripherals/sensor/Kconfig
 /Users/hiveton/HivetonCode/HivetonWodleXiaozhi/sdk/customer/peripherals/vibrator/Kconfig
-/Users/hiveton/HivetonCode/HivetonWodleXiaozhi/sdk/customer/peripherals/wifi/Kconfig
 /Users/hiveton/HivetonCode/HivetonWodleXiaozhi/sdk/external/CMSIS/Kconfig
 /Users/hiveton/HivetonCode/HivetonWodleXiaozhi/sdk/external/CmBacktrace-v1.3.0/Kconfig
 /Users/hiveton/HivetonCode/HivetonWodleXiaozhi/sdk/external/FlashDB/Kconfig
