@@ -7,6 +7,8 @@
 #include "rtthread.h"
 #include "bf0_hal.h"
 #include "drv_io.h"
+#include "littlevgl2rtt.h"
+#include "lvgl.h"
 #include "stdio.h"
 #include "string.h"
 #include "xiaozhi_websocket.h"
@@ -700,6 +702,8 @@ void check_low_power(void)
             g_skip_startup = false;
             rt_kprintf("电量不足，进入低电量关机流程，当前电量为%d%%\n", battery_percentage);
             xz_set_lcd_brightness(LCD_BRIGHTNESS_DEFAULT);
+            
+            // 小智UI启动线程
             rt_err_t result = rt_thread_init(&xiaozhi_ui_thread,
                                              "xz_ui",
                                              xiaozhi_ui_task,
@@ -728,6 +732,7 @@ void check_low_power(void)
         rt_kprintf("电量充足，正常开机\n");
     }
 }
+
 int main(void)
 {
     check_poweron_reason();
@@ -740,6 +745,7 @@ int main(void)
     }
     //初始化电池邮箱
     g_battery_mb = rt_mb_create("battery_level", 1, RT_IPC_FLAG_FIFO);
+
 #ifdef LOW_POWER_NO_SHUTDOWN  //针对立创没有电池的板子
 
 #else

@@ -1,5 +1,0 @@
-source "$SIFLI_SDK/Kconfig.v2"
-source "$SIFLI_SDK/customer/boards/Kconfig.v2"
-source "/Users/hiveton/HivetonCode/HivetonWodleXiaozhi/sdk/customer/boards/sf32lb52-lcd_n16r8/hcpu/Kconfig.board"
-osource "/Users/hiveton/HivetonCode/HivetonWodleXiaozhi/sdk/example/flash_table/sf32lb52x_common_v2/sf-pkgs/Kconfig.conandeps"
-source "/Users/hiveton/HivetonCode/HivetonWodleXiaozhi/sdk/example/flash_table/sf32lb52x_common_v2/Kconfig.proj"

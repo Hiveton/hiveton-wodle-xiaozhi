@@ -12,8 +12,22 @@
 #define DBG_LVL DBG_INFO
 #include "log.h"
 
-#define EPD_WIDTH 528
-#define EPD_HEIGHT 792
+#define EPD_SRC_PIXELS 792
+#define EPD_GATE_PIXELS 528
+#define EPD_WIDTH EPD_SRC_PIXELS
+#define EPD_HEIGHT EPD_GATE_PIXELS
+#define EPD_GRAY2_FRAME_SIZE (EPD_WIDTH * EPD_HEIGHT / 4) /* 2bpp */
+#define EPD_MONO_FRAME_SIZE (EPD_WIDTH * EPD_HEIGHT / 8)  /* 1bpp */
+#define EPD_SELF_TEST_PATTERN 0
+#define EPD_USE_SCAN_MODE3 1
+/* Scan total and visible window can differ (per UC8179 reference code). */
+#define EPD_SCAN_SRC_PIXELS EPD_SRC_PIXELS
+/* Vendor sample uses total gate scan 600 with visible window starting at Y=72 (0x48). */
+#define EPD_SCAN_GATE_PIXELS 600
+#define EPD_WIN_X_START 0
+#define EPD_WIN_Y_START 72
+#define EPD_WIN_WIDTH EPD_WIDTH
+#define EPD_WIN_HEIGHT EPD_HEIGHT
 
 static const unsigned char EPD_lut_full_update[] = {
     0x02, 0x02, 0x01, 0x11, 0x12, 0x12, 0x22, 0x22, 0x66, 0x69,
@@ -82,8 +96,8 @@ const unsigned char LUT_GC[282]={
 #define EPD_PART 1
 
 #define EPD_LCD_ID 0x09ff
-#define LCD_PIXEL_WIDTH 240
-#define LCD_PIXEL_HEIGHT 240
+#define LCD_PIXEL_WIDTH EPD_WIDTH
+#define LCD_PIXEL_HEIGHT EPD_HEIGHT
 #define LCD_HOR_RES_MAX_8 LCD_HOR_RES_MAX / 8
 
 #define PICTURE_LENGTH (LCD_HOR_RES_MAX / 8 * LCD_VER_RES_MAX)
@@ -120,6 +134,8 @@ static int reflesh_times;
 static uint8_t current_refresh_mode;
 static unsigned char LUT_Flag = 0; // LUT切换标志
 static unsigned char Var_Temp = 0; // 温度值
+static rt_tick_t s_last_epd_refresh_tick = 0;
+static uint8_t s_frame_collecting = 0;
 
 static LCDC_InitTypeDef lcdc_int_cfg = {
     .lcd_itf = LCDC_INTF_SPI_DCX_1DATA,
@@ -139,6 +155,7 @@ static LCDC_InitTypeDef lcdc_int_cfg = {
 };
 
 LCDC_HandleTypeDef hlcdc;
+static uint16_t g_input_color_mode = RTGRAPHIC_PIXEL_FORMAT_RGB565;
 static uint32_t LCD_ReadID(LCDC_HandleTypeDef *hlcdc);
 static void LCD_WriteReg(LCDC_HandleTypeDef *hlcdc, uint16_t LCD_Reg,
                          uint8_t *Parameters, uint32_t NbParameters);
@@ -151,24 +168,83 @@ static void EPD_EnterDeepSleep(LCDC_HandleTypeDef *hlcdc);
 static void EPD_LoadLUT(LCDC_HandleTypeDef *hlcdc, uint8_t lut_mode);
 static void LUTGC(LCDC_HandleTypeDef *hlcdc);
 static void EPD_Refresh(LCDC_HandleTypeDef *hlcdc);
+static void EPD_ReadBusy(void);
 static void EPD_SendCommandDataBuf(LCDC_HandleTypeDef *hlcdc, uint8_t cmd,
                                    const uint8_t *data, uint16_t len);
+static void EPD_SetFullWindow(LCDC_HandleTypeDef *hlcdc);
 
 L2_NON_RET_BSS_SECT_BEGIN(frambuf)
 L2_NON_RET_BSS_SECT(frambuf,
-                    ALIGN(64) static uint8_t mixed_framebuffer[EPD_WIDTH / 8 * EPD_HEIGHT]);
+                    ALIGN(64) static uint8_t mixed_framebuffer[EPD_GRAY2_FRAME_SIZE]);
+L2_NON_RET_BSS_SECT(frambuf,
+                    ALIGN(64) static uint8_t mixed_framebuffer_mono[EPD_MONO_FRAME_SIZE]);
 L2_NON_RET_BSS_SECT_END
 
 static uint8_t framebuffer_initialized = 0;
 
 static rt_sem_t epd_busy_sem = RT_NULL;
 
+static inline uint8_t epd_clamp_gray2(uint8_t lv)
+{
+    return (lv > 3) ? 3 : lv;
+}
+
+static inline void epd_set_gray2_pixel(uint16_t x, uint16_t y, uint8_t lv)
+{
+    uint32_t px = (uint32_t)y * EPD_WIDTH + x;
+    uint32_t byte_idx = px >> 2;              /* 4 pixels per byte */
+    uint8_t shift = (uint8_t)((3 - (px & 0x3)) << 1); /* MSB first */
+    uint8_t mask = (uint8_t)(0x3u << shift);
+    lv = epd_clamp_gray2(lv);
+    mixed_framebuffer[byte_idx] = (uint8_t)((mixed_framebuffer[byte_idx] & ~mask) | (lv << shift));
+}
+
+static inline uint8_t epd_get_gray2_pixel(uint16_t x, uint16_t y)
+{
+    uint32_t px = (uint32_t)y * EPD_WIDTH + x;
+    uint32_t byte_idx = px >> 2;
+    uint8_t shift = (uint8_t)((3 - (px & 0x3)) << 1);
+    return (uint8_t)((mixed_framebuffer[byte_idx] >> shift) & 0x3u);
+}
+
+static void EPD_Gray2ToMonoDither(void)
+{
+    static const uint8_t bayer2x2[2][2] = {
+        {0, 2},
+        {3, 1},
+    };
+    memset(mixed_framebuffer_mono, 0xFF, sizeof(mixed_framebuffer_mono));
+
+    for (uint16_t y = 0; y < EPD_HEIGHT; y++)
+    {
+        for (uint16_t x = 0; x < EPD_WIDTH; x++)
+        {
+            uint8_t lv = epd_get_gray2_pixel(x, y); /* 0=black ... 3=white */
+            uint8_t threshold = bayer2x2[y & 1][x & 1];
+            /* level density: 0->0/4, 1->1/4, 2->2/4, 3->4/4 */
+            uint8_t is_white = (lv == 3) ? 1 : ((lv > threshold) ? 1 : 0);
+
+            uint32_t byte_idx = (uint32_t)y * (EPD_WIDTH / 8) + (x / 8);
+            uint8_t bit_pos = (uint8_t)(7 - (x % 8));
+            if (is_white)
+            {
+                mixed_framebuffer_mono[byte_idx] |= (uint8_t)(1u << bit_pos);
+            }
+            else
+            {
+                mixed_framebuffer_mono[byte_idx] &= (uint8_t)~(1u << bit_pos);
+            }
+        }
+    }
+}
+
 /**
  * @brief 初始化帧缓冲区为全白
  */
 static void EPD_FrameBuffer_Init(void)
 {
-    memset(mixed_framebuffer, 0xFF, EPD_WIDTH / 8 * EPD_HEIGHT);
+    memset(mixed_framebuffer, 0xFF, sizeof(mixed_framebuffer)); /* default white (3) by packed bytes */
+    memset(mixed_framebuffer_mono, 0xFF, sizeof(mixed_framebuffer_mono));
     framebuffer_initialized = 1;
 }
 
@@ -179,7 +255,7 @@ static void EPD_FrameBuffer_Init(void)
  * @param y0 起始Y坐标
  * @param x1 结束X坐标
  * @param y1 结束Y坐标
- * @note 将RGB332数据转换为1bpp格式存入缓冲区
+ * @note 将RGB332数据转换为2bpp（4色阶）格式存入缓冲区
  */
 static void EPD_FrameBuffer_UpdateRegion(const uint8_t *data, uint16_t x0, uint16_t y0, 
                                           uint16_t x1, uint16_t y1)
@@ -208,27 +284,53 @@ static void EPD_FrameBuffer_UpdateRegion(const uint8_t *data, uint16_t x0, uint1
             uint32_t src_idx = (y - y0) * src_width + (x - x0);
             uint8_t pixel = data[src_idx];
             
-            // 将RGB332转换为1bpp (简单阈值判断)
+            // 将RGB332转换为4级灰度（0=黑,1=深灰,2=浅灰,3=白）
             // RGB332: RRRGGGBB, 计算灰度值
             uint8_t r = (pixel >> 5) & 0x07;  // 3 bits
             uint8_t g = (pixel >> 2) & 0x07;  // 3 bits
             uint8_t b = pixel & 0x03;         // 2 bits
-            // 灰度近似: (R*3 + G*3 + B*2) / 8 * 32
-            uint16_t gray = r * 36 + g * 36 + b * 64;  // 0-252 范围
-            uint8_t mono = (gray > 126) ? 1 : 0;  // 1=白, 0=黑
-            
-            // 计算在帧缓冲区中的位置 (1bpp格式)
-            uint32_t byte_idx = y * (EPD_WIDTH / 8) + (x / 8);
-            uint8_t bit_pos = 7 - (x % 8);  // MSB first
-            
-            if (mono)
-            {
-                mixed_framebuffer[byte_idx] |= (1 << bit_pos);   // 设置为白
-            }
-            else
-            {
-                mixed_framebuffer[byte_idx] &= ~(1 << bit_pos);  // 设置为黑
-            }
+            uint16_t gray = (uint16_t)r * 36 + (uint16_t)g * 36 + (uint16_t)b * 64;  // 0-252
+            uint8_t gray2 = (gray < 64) ? 0 : (gray < 128) ? 1 : (gray < 192) ? 2 : 3;
+            epd_set_gray2_pixel(x, y, gray2);
+        }
+    }
+}
+
+static void EPD_FrameBuffer_UpdateRegionRGB565(const uint8_t *data, uint16_t x0, uint16_t y0,
+                                                uint16_t x1, uint16_t y1)
+{
+    if (data == NULL || x0 > x1 || y0 > y1)
+    {
+        return;
+    }
+
+    if (x1 >= EPD_WIDTH) x1 = EPD_WIDTH - 1;
+    if (y1 >= EPD_HEIGHT) y1 = EPD_HEIGHT - 1;
+
+    if (!framebuffer_initialized)
+    {
+        EPD_FrameBuffer_Init();
+    }
+
+    uint16_t src_width = x1 - x0 + 1;
+
+    for (uint16_t y = y0; y <= y1; y++)
+    {
+        for (uint16_t x = x0; x <= x1; x++)
+        {
+            uint32_t src_idx = (uint32_t)((y - y0) * src_width + (x - x0));
+            uint16_t pixel565 = (uint16_t)data[src_idx * 2] | ((uint16_t)data[src_idx * 2 + 1] << 8);
+
+            uint8_t r5 = (uint8_t)((pixel565 >> 11) & 0x1F);
+            uint8_t g6 = (uint8_t)((pixel565 >> 5) & 0x3F);
+            uint8_t b5 = (uint8_t)(pixel565 & 0x1F);
+            uint8_t r8 = (uint8_t)((r5 << 3) | (r5 >> 2));
+            uint8_t g8 = (uint8_t)((g6 << 2) | (g6 >> 4));
+            uint8_t b8 = (uint8_t)((b5 << 3) | (b5 >> 2));
+
+            uint16_t gray = (uint16_t)(r8 * 30 + g8 * 59 + b8 * 11) / 100;
+            uint8_t gray2 = (gray < 64) ? 0 : (gray < 128) ? 1 : (gray < 192) ? 2 : 3;
+            epd_set_gray2_pixel(x, y, gray2);
         }
     }
 }
@@ -258,16 +360,21 @@ static void EPD_FrameBuffer_UpdateRegion1bpp(const uint8_t *data, uint16_t x0, u
         EPD_FrameBuffer_Init();
     }
     
-    // x坐标对齐到字节边界
+    // 将1bpp源数据映射到2bpp灰度缓存（0->黑，1->白）
     uint16_t x0_byte = x0 / 8;
     uint16_t x1_byte = x1 / 8;
     uint16_t src_bytes_per_row = x1_byte - x0_byte + 1;
     
     for (uint16_t y = y0; y <= y1; y++)
     {
-        uint32_t dst_offset = y * (EPD_WIDTH / 8) + x0_byte;
         uint32_t src_offset = (y - y0) * src_bytes_per_row;
-        memcpy(&mixed_framebuffer[dst_offset], &data[src_offset], src_bytes_per_row);
+        for (uint16_t x = x0; x <= x1; x++)
+        {
+            uint32_t src_byte_idx = src_offset + ((x - x0) / 8);
+            uint8_t src_bit = (uint8_t)(7 - ((x - x0) % 8));
+            uint8_t mono = (uint8_t)((data[src_byte_idx] >> src_bit) & 0x1u);
+            epd_set_gray2_pixel(x, y, mono ? 3 : 0);
+        }
     }
 }
 
@@ -282,25 +389,21 @@ static void EPD_FrameBuffer_Flush(LCDC_HandleTypeDef *hlcdc)
         EPD_FrameBuffer_Init();
     }
     
+    EPD_ReadBusy();
+
     // 加载 GC 模式的 LUT
     LUTGC(hlcdc);
+
+#if EPD_USE_SCAN_MODE3
+    EPD_SetFullWindow(hlcdc);
+#endif
     
     // 使用Layer方式发送帧缓冲区数据
-    uint32_t total_size = EPD_WIDTH / 8 * EPD_HEIGHT;
-    
-    // 设置 Layer 数据格式为 RGB332 (1字节/像素，实际是1bpp打包数据)
-    HAL_LCDC_LayerSetFormat(hlcdc, HAL_LCDC_LAYER_DEFAULT, LCDC_PIXEL_FORMAT_RGB332);
-    
-    // 设置 Layer 数据源 - 整个帧缓冲区
-    HAL_LCDC_LayerSetData(hlcdc, HAL_LCDC_LAYER_DEFAULT, mixed_framebuffer, 
-                          0, 0, EPD_WIDTH / 8 - 1, EPD_HEIGHT - 1);
-    
-    // 发送数据到寄存器
-    if (HAL_LCDC_SendLayerData2Reg_IT(hlcdc, REG_WRITE_NEW_DATA, 1) != HAL_OK)
-    {
-        rt_kprintf("EPD flush: SendLayerData failed\n");
-        return;
-    }
+    EPD_Gray2ToMonoDither();
+
+    /* Vendor flow: normal display writes new/BW RAM (0x13), then refresh. */
+    EPD_SendCommandDataBuf(hlcdc, REG_WRITE_NEW_DATA, mixed_framebuffer_mono,
+                           EPD_MONO_FRAME_SIZE);
     
     // 刷新显示
     EPD_Refresh(hlcdc);
@@ -311,8 +414,32 @@ static void EPD_FrameBuffer_Flush(LCDC_HandleTypeDef *hlcdc)
  */
 static void EPD_FrameBuffer_Clear(void)
 {
-    memset(mixed_framebuffer, 0xFF, EPD_WIDTH / 8 * EPD_HEIGHT);
+    memset(mixed_framebuffer, 0xFF, sizeof(mixed_framebuffer));
+    memset(mixed_framebuffer_mono, 0xFF, sizeof(mixed_framebuffer_mono));
     framebuffer_initialized = 1;
+}
+
+static void EPD_DrawCenteredCircleTest(void)
+{
+    int32_t cx = EPD_WIDTH / 2;
+    int32_t cy = EPD_HEIGHT / 2;
+    int32_t r = (EPD_WIDTH < EPD_HEIGHT ? EPD_WIDTH : EPD_HEIGHT) / 4;
+    int32_t r2 = r * r;
+
+    EPD_FrameBuffer_Clear();
+
+    for (int32_t y = 0; y < EPD_HEIGHT; y++)
+    {
+        int32_t dy = y - cy;
+        for (int32_t x = 0; x < EPD_WIDTH; x++)
+        {
+            int32_t dx = x - cx;
+            if ((dx * dx + dy * dy) <= r2)
+            {
+                epd_set_gray2_pixel((uint16_t)x, (uint16_t)y, 0);
+            }
+        }
+    }
 }
 
 /**
@@ -320,7 +447,8 @@ static void EPD_FrameBuffer_Clear(void)
  */
 static void EPD_FrameBuffer_Fill(void)
 {
-    memset(mixed_framebuffer, 0x00, EPD_WIDTH / 8 * EPD_HEIGHT);
+    memset(mixed_framebuffer, 0x00, sizeof(mixed_framebuffer));
+    memset(mixed_framebuffer_mono, 0x00, sizeof(mixed_framebuffer_mono));
     framebuffer_initialized = 1;
 }
 
@@ -355,6 +483,27 @@ static void EPD_SendCommandDataBuf(LCDC_HandleTypeDef *hlcdc, uint8_t cmd,
 {
     HAL_LCDC_WriteU8Reg(hlcdc, cmd, (uint8_t *)data, len);
 }
+
+static void EPD_SetFullWindow(LCDC_HandleTypeDef *hlcdc)
+{
+    uint16_t x_start = EPD_WIN_X_START;
+    uint16_t y_start = EPD_WIN_Y_START;
+    uint16_t x_end = (uint16_t)(EPD_WIN_X_START + EPD_WIN_WIDTH - 1);
+    uint16_t y_end = (uint16_t)(EPD_WIN_Y_START + EPD_WIN_HEIGHT - 1);
+
+    if (x_end >= EPD_SCAN_SRC_PIXELS) x_end = EPD_SCAN_SRC_PIXELS - 1;
+    if (y_end >= EPD_SCAN_GATE_PIXELS) y_end = EPD_SCAN_GATE_PIXELS - 1;
+
+    uint8_t win[9] = {
+        (uint8_t)(x_start >> 8), (uint8_t)(x_start & 0xFF),
+        (uint8_t)(x_end >> 8), (uint8_t)(x_end & 0xFF),
+        (uint8_t)(y_start >> 8), (uint8_t)(y_start & 0xFF),
+        (uint8_t)(y_end >> 8), (uint8_t)(y_end & 0xFF),
+        0x01
+    };
+    EPD_SendCommand(hlcdc, 0x91);
+    EPD_SendCommandDataBuf(hlcdc, 0x90, win, sizeof(win));
+}
 static void epd_busy_callback(void *args)
 {
     rt_sem_release(epd_busy_sem);
@@ -388,14 +537,20 @@ static void epd_sem_init(void)
 
 static void EPD_ReadBusy(void)
 {
-    rt_pin_irq_enable(2, PIN_IRQ_ENABLE);
-    rt_err_t result = rt_sem_take(epd_busy_sem, RT_TICK_PER_SECOND * 2);
-    if (result != RT_EOK)
-    {
-        rt_kprintf("EPD busy wait timeout! (may cause display error)\n");
-    }
+    /* Follow vendor sample: busy=0 means busy, wait until BUSY goes high. */
+    rt_tick_t start = rt_tick_get();
+    rt_tick_t timeout = rt_tick_from_millisecond(10000);
 
-    rt_sem_control(epd_busy_sem, RT_IPC_CMD_RESET, RT_NULL);
+    while (rt_pin_read(2) == 0)
+    {
+        if ((rt_tick_get() - start) > timeout)
+        {
+            rt_kprintf("EPD busy wait timeout! pin=%d\n", rt_pin_read(2));
+            break;
+        }
+        rt_thread_mdelay(5);
+    }
+    rt_thread_mdelay(2);
 }
 
 static void EPD_Reset(LCDC_HandleTypeDef *hlcdc)
@@ -434,18 +589,32 @@ static void LCD_Drv_Init(LCDC_HandleTypeDef *hlcdc, uint8_t Mode)
     EPD_Reset(hlcdc);
 
 
-    // 扫描反向1
+    // 扫描配置
+#if EPD_USE_SCAN_MODE3
+    // 参考屏厂“扫描反向3”路径：配合 0x91/0x90 全窗地址
+    uint8_t scan_data[2] = {0x37, 0x0A};
+#else
     uint8_t scan_data[2] = {0x3F, 0x0A};
+#endif
     EPD_SendCommandDataBuf(hlcdc, 0x00, scan_data, 2);
 
-    // Resolution
-    uint8_t resolution_data[4] = {0x03, 0x18, 0x02, 0x58}; // 600
+    // Resolution register uses controller scan total
+    uint8_t resolution_data[4] = {
+        (uint8_t)(EPD_SCAN_SRC_PIXELS >> 8),
+        (uint8_t)(EPD_SCAN_SRC_PIXELS & 0xFF),
+        (uint8_t)(EPD_SCAN_GATE_PIXELS >> 8),
+        (uint8_t)(EPD_SCAN_GATE_PIXELS & 0xFF),
+    };
     EPD_SendCommandDataBuf(hlcdc, 0x61, resolution_data, 4);
     EPD_ReadBusy();
 
+#if EPD_USE_SCAN_MODE3
+    EPD_SetFullWindow(hlcdc);
+#else
     // Scan starting address
     uint8_t scan_addr_data[4] = {0x00, 0x00, 0x00, 0x00};
     EPD_SendCommandDataBuf(hlcdc, 0x65, scan_addr_data, 4);
+#endif
 
     // PFS
     EPD_SendCommandData(hlcdc, 0x03, 0x30);
@@ -473,20 +642,11 @@ static void LCD_Drv_Init(LCDC_HandleTypeDef *hlcdc, uint8_t Mode)
 
     // Power ON
     EPD_SendCommand(hlcdc, 0x04);
-    // EPD_ReadBusy();
-    rt_thread_delay(2000);
+    EPD_ReadBusy();
 
-    // Write BW RAM - 填充白色
-    // Note: Gate_Pixel和Source_Pixel需要根据实际屏幕参数定义
-    // 这里使用EPD_WIDTH和EPD_HEIGHT
-    uint16_t ram_size = (EPD_WIDTH / 8) * EPD_HEIGHT;
-    uint8_t *ram_buf = rt_malloc(ram_size);
-    if (ram_buf != RT_NULL)
-    {
-        memset(ram_buf, 0xFF, ram_size);
-        EPD_SendCommandDataBuf(hlcdc, 0x10, ram_buf, ram_size);
-        rt_free(ram_buf);
-    }
+    /* Initialize old RAM to white baseline. */
+    EPD_FrameBuffer_Init();
+    EPD_SendCommandDataBuf(hlcdc, 0x10, mixed_framebuffer_mono, EPD_MONO_FRAME_SIZE);
 }
 
 
@@ -496,6 +656,9 @@ static void EPD_Refresh(LCDC_HandleTypeDef *hlcdc)
 {
     EPD_SendCommand(hlcdc, 0x12);
     EPD_ReadBusy();
+#if EPD_USE_SCAN_MODE3
+    EPD_SendCommand(hlcdc, 0x92);
+#endif
 }
 
 // 加载 GC 模式的 LUT 表
@@ -526,20 +689,11 @@ void EPD_Clear(LCDC_HandleTypeDef *hlcdc)
 {
     // 加载 GC 模式的 LUT
     LUTGC(hlcdc);
-    
-    // Write BW RAM - 填充白色
-    uint32_t ram_size = (EPD_WIDTH / 8) * EPD_HEIGHT;
-    uint8_t *ram_buf = rt_malloc(ram_size);
-    if (ram_buf != RT_NULL)
-    {
-        memset(ram_buf, 0xFF, ram_size);
-        EPD_SendCommandDataBuf(hlcdc, 0x13, ram_buf, ram_size);
-        rt_free(ram_buf);
-    }
-    else
-    {
-        rt_kprintf("EPD clear ram buf malloc failed\n");
-    }
+
+    /* Baseline clear: force both old/new to white, then full refresh twice. */
+    EPD_FrameBuffer_Clear();
+    EPD_SendCommandDataBuf(hlcdc, 0x10, mixed_framebuffer_mono, EPD_MONO_FRAME_SIZE);
+    EPD_SendCommandDataBuf(hlcdc, 0x13, mixed_framebuffer_mono, EPD_MONO_FRAME_SIZE);
     EPD_Refresh(hlcdc);
     EPD_Refresh(hlcdc);
 }
@@ -558,6 +712,10 @@ static void LCD_Init(LCDC_HandleTypeDef *hlcdc)
     rt_kprintf("EPD initialized\n");
     EPD_Clear(hlcdc);
     rt_kprintf("EPD initialized\n");
+#if EPD_SELF_TEST_PATTERN
+    EPD_DrawCenteredCircleTest();
+    EPD_FrameBuffer_Flush(hlcdc);
+#endif
     // rt_thread_mdelay(10000);
 }
 
@@ -586,8 +744,9 @@ static void LCD_DisplayOff(LCDC_HandleTypeDef *hlcdc)
 static void LCD_SetRegion(LCDC_HandleTypeDef *hlcdc, uint16_t Xpos0,
                           uint16_t Ypos0, uint16_t Xpos1, uint16_t Ypos1)
 {
-    HAL_LCDC_SetROIArea(hlcdc, 0, 0, LCD_HOR_RES_MAX_8 - 1,
-                        LCD_VER_RES_MAX - 1);
+    if (Xpos1 >= EPD_WIDTH) Xpos1 = EPD_WIDTH - 1;
+    if (Ypos1 >= EPD_HEIGHT) Ypos1 = EPD_HEIGHT - 1;
+    HAL_LCDC_SetROIArea(hlcdc, Xpos0, Ypos0, Xpos1, Ypos1);
 }
 
 static void LCD_WritePixel(LCDC_HandleTypeDef *hlcdc, uint16_t Xpos,
@@ -599,7 +758,15 @@ static void LCD_WritePixel(LCDC_HandleTypeDef *hlcdc, uint16_t Xpos,
     }
     rt_kprintf("EPD single pixel: (%d,%d)\n", Xpos, Ypos);
     // 更新帧缓冲区单个像素
-    EPD_FrameBuffer_UpdateRegion(RGBCode, Xpos, Ypos, Xpos, Ypos);
+    if (g_input_color_mode == RTGRAPHIC_PIXEL_FORMAT_RGB565 ||
+        g_input_color_mode == LCDC_PIXEL_FORMAT_RGB565)
+    {
+        EPD_FrameBuffer_UpdateRegionRGB565(RGBCode, Xpos, Ypos, Xpos, Ypos);
+    }
+    else
+    {
+        EPD_FrameBuffer_UpdateRegion(RGBCode, Xpos, Ypos, Xpos, Ypos);
+    }
     
     // 注意: 单像素写入不会立即刷新屏幕，需要调用者手动触发刷新
     // 如果需要立即刷新，取消下面的注释
@@ -619,13 +786,52 @@ static void LCD_WriteMultiplePixels(LCDC_HandleTypeDef *hlcdc,
     rt_kprintf("EPD multiple pixels: (%d,%d)-(%d,%d)\n",
                Xpos0, Ypos0, Xpos1, Ypos1);
 
+    /* 仅支持全局刷新：开始收集新一帧时先白底清空，避免上帧残留条带叠加 */
+    if (!s_frame_collecting)
+    {
+        EPD_FrameBuffer_Clear();
+        s_frame_collecting = 1;
+    }
+
     // 更新帧缓冲区对应区域
-    EPD_FrameBuffer_UpdateRegion(RGBCode, Xpos0, Ypos0, Xpos1, Ypos1);
+    if (g_input_color_mode == RTGRAPHIC_PIXEL_FORMAT_RGB565 ||
+        g_input_color_mode == LCDC_PIXEL_FORMAT_RGB565)
+    {
+        EPD_FrameBuffer_UpdateRegionRGB565(RGBCode, Xpos0, Ypos0, Xpos1, Ypos1);
+    }
+    else
+    {
+        EPD_FrameBuffer_UpdateRegion(RGBCode, Xpos0, Ypos0, Xpos1, Ypos1);
+    }
     
-    // 将帧缓冲区全屏刷新到墨水屏
-    EPD_FrameBuffer_Flush(hlcdc);
+    /* 该屏只支持全局刷新：只在收到“最后一片”时触发一次全刷。 */
+    if (Ypos1 >= (EPD_HEIGHT - 1))
+    {
+        rt_tick_t min_interval = rt_tick_from_millisecond(300);
+        rt_tick_t now = rt_tick_get();
+        rt_tick_t elapsed = now - s_last_epd_refresh_tick;
+
+        if ((s_last_epd_refresh_tick != 0) && (elapsed < min_interval))
+        {
+            rt_thread_delay(min_interval - elapsed);
+        }
+
+        EPD_FrameBuffer_Flush(hlcdc);
+        s_last_epd_refresh_tick = rt_tick_get();
+        s_frame_collecting = 0;
+    }
 
     reflesh_times++;
+
+    /*
+     * EPD path uses synchronous command writes (not LCDC layer DMA), so there is
+     * no hardware transfer-complete IRQ to release drv_lcd draw_sem.
+     * Notify completion explicitly to avoid draw_core timeout in lcd_task.
+     */
+    if (hlcdc->XferCpltCallback != NULL)
+    {
+        hlcdc->XferCpltCallback(hlcdc);
+    }
 }
 static void LCD_WriteReg(LCDC_HandleTypeDef *hlcdc, uint16_t LCD_Reg,
                          uint8_t *Parameters, uint32_t NbParameters)
@@ -664,12 +870,15 @@ static uint32_t LCD_ReadPixel(LCDC_HandleTypeDef *hlcdc, uint16_t Xpos,
 static void LCD_SetColorMode(LCDC_HandleTypeDef *hlcdc, uint16_t color_mode)
 {
     if (color_mode != RTGRAPHIC_PIXEL_FORMAT_RGB332 &&
-        color_mode != LCDC_PIXEL_FORMAT_RGB332)
+        color_mode != LCDC_PIXEL_FORMAT_RGB332 &&
+        color_mode != RTGRAPHIC_PIXEL_FORMAT_RGB565 &&
+        color_mode != LCDC_PIXEL_FORMAT_RGB565)
     {
-        rt_kprintf("EPD only support mono-color, ignore mode: %d\n",
+        rt_kprintf("EPD unsupported input mode: %d\n",
                    color_mode);
         return;
     }
+    g_input_color_mode = color_mode;
     lcdc_int_cfg.color_mode = LCDC_PIXEL_FORMAT_RGB332;
     HAL_LCDC_SetOutFormat(hlcdc, lcdc_int_cfg.color_mode);
     // rt_kprintf("EPD set color mode: mono-color (1bit)\n");
@@ -838,4 +1047,4 @@ static const LCD_DrvOpsDef epd_spi_drv = {LCD_Init,
                                           LCD_IdleModeOff};
 
 LCD_DRIVER_EXPORT(epd_spi, EPD_LCD_ID, &lcdc_int_cfg, &epd_spi_drv,
-                  LCD_PIXEL_WIDTH, LCD_PIXEL_HEIGHT, 8);
+                  LCD_PIXEL_WIDTH, LCD_PIXEL_HEIGHT, 16);
