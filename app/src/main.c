@@ -61,7 +61,7 @@
 #define MQTT_RECONNECT 12
 
 #define MAX_RECONNECT_ATTEMPTS 30  // 30次尝试，每次1秒，共30秒
-#define XIAOZHI_UI_THREAD_STACK_SIZE (6144)
+#define XIAOZHI_UI_THREAD_STACK_SIZE (12288)
 #define BATTERY_THREAD_STACK_SIZE (2048)
 #define LOW_BATTERY_THRESHOLD 5
 
@@ -97,8 +97,6 @@ static struct rt_thread battery_thread;
 // 最新版本信息
 extern char latest_version[32];
 
-
-extern const lv_image_dsc_t t6;
 
 //ui线程
 #if defined(__CC_ARM) || defined(__CLANG_ARM)
@@ -282,15 +280,12 @@ static void battery_level_task(void *parameter)
         //当电量低于阈值并且当前没有处于充电中并的时候
         if (battery_percentage < LOW_BATTERY_THRESHOLD && low_battery_shutdown_triggered && !current_status) 
         {
-            lv_obj_t *now_screen = lv_screen_active();
-            rt_kprintf("now_screen address: %p, sleep_screen address: %p, standby_screen address: %p\n", 
-               now_screen, sleep_screen, standby_screen);
             low_battery_shutdown_triggered = false;
             rt_kprintf("Low battery ,shutdown\n");
             //发送消息到UI线程显示低电量关机页面
             if (g_ui_task_mb != RT_NULL) 
             {
-                if(now_screen == sleep_screen && now_screen != NULL)
+                if (g_low_power_mode)
                 {
                     lowpower_shutdown_state = false;
                     gui_pm_fsm(GUI_PM_ACTION_WAKEUP); // 唤醒设备
@@ -476,11 +471,7 @@ static int bt_app_interface_event_handle(uint16_t type, uint16_t event_id,
             g_bt_app_env.bt_connected = FALSE;
             xiaozhi_ui_chat_output("蓝牙断开连接");
             xiaozhi_ui_standby_chat_output("蓝牙断开连接");//待机画面
-            lv_obj_t *now_screen = lv_screen_active();
-            if (now_screen != standby_screen && now_screen != sleep_screen && now_screen != shutdown_screen)
-                {
-                    ui_swith_to_standby_screen();
-                }
+            ui_swith_to_standby_screen();
             //  memset(&g_bt_app_env.bd_addr, 0xFF,
             //  sizeof(g_bt_app_env.bd_addr));
                  if (info->res == BT_NOTIFY_COMMON_SCO_DISCONNECTED) 
@@ -735,47 +726,8 @@ void check_low_power(void)
     }
 }
 
-static void show_test_png_and_block(void)
-{
-    rt_err_t ret = littlevgl2rtt_init("lcd");
-    if (ret != RT_EOK)
-    {
-        rt_kprintf("littlevgl2rtt_init failed: %d\n", ret);
-        while (1)
-        {
-            rt_thread_mdelay(1000);
-        }
-    }
-
-    lv_obj_t *screen = lv_obj_create(NULL);
-    lv_obj_set_size(screen, LV_PCT(100), LV_PCT(100));
-    lv_obj_set_style_bg_color(screen, lv_color_hex(0x000000), LV_PART_MAIN | LV_STATE_DEFAULT);
-    lv_obj_set_style_border_width(screen, 0, 0);
-
-    lv_obj_t *img = lv_img_create(screen);
-    lv_img_set_src(img, &t6);
-    rt_kprintf("screen=%dx%d, image=%dx%d\n",
-               lv_display_get_horizontal_resolution(NULL),
-               lv_display_get_vertical_resolution(NULL),
-               t6.header.w, t6.header.h);
-
-    /* test.png is prepared as panel-native resolution, keep strict 1:1 mapping. */
-    lv_img_set_zoom(img, 256);
-
-    lv_obj_center(img);
-    lv_screen_load(screen);
-
-    while (1)
-    {
-        lv_task_handler();
-        rt_thread_mdelay(5);
-    }
-}
-
 int main(void)
 {
-    show_test_png_and_block();
-
     check_poweron_reason();
     // 初始化邮箱
     g_button_event_mb = rt_mb_create("btn_evt", 8, RT_IPC_FLAG_FIFO);
@@ -947,7 +899,7 @@ int main(void)
             } 
 
             xiaozhi_ui_standby_chat_output("请按键连接小智...");
-            lv_display_trigger_activity(NULL);
+            xiaozhi_ui_trigger_activity();
 
 #ifdef XIAOZHI_USING_MQTT
             xiaozhi(0,NULL);
@@ -960,7 +912,7 @@ int main(void)
             if (!ui_sleep_timer && g_pan_connected)
             {
                 rt_kprintf("create sleep timer2\n");
-                ui_sleep_timer = lv_timer_create(ui_sleep_callback, 40000, NULL);
+                xiaozhi_ui_start_sleep_timer(40000);
             }
         }
         else if (value == KEEP_FIRST_PAN_RECONNECT)

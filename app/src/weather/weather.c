@@ -469,6 +469,33 @@ __exit:
     return ret;
 }
 
+static void update_home_status_meta(void)
+{
+    extern lv_obj_t *home_meta_label;
+
+    if (home_meta_label)
+    {
+        char meta_text[96];
+        char temp_text[16];
+
+        if (g_current_weather.last_update > 0)
+        {
+            snprintf(temp_text, sizeof(temp_text), "%d°C",
+                     g_current_weather.temperature);
+        }
+        else
+        {
+            snprintf(temp_text, sizeof(temp_text), "--°C");
+        }
+
+        snprintf(meta_text, sizeof(meta_text), "%04d/%02d/%02d\n%s %s",
+                 g_current_time.year, g_current_time.month, g_current_time.day,
+                 g_current_time.weekday_str[0] ? g_current_time.weekday_str : "星期一",
+                 temp_text);
+        lv_label_set_text(home_meta_label, meta_text);
+    }
+}
+
 void time_ui_update_callback(void)
 {
     static int last_year = -1;
@@ -495,6 +522,7 @@ void time_ui_update_callback(void)
     extern lv_obj_t *minute_tens_img;
     extern lv_obj_t *minute_units_img;
     extern lv_obj_t *ui_Label_second;
+    extern lv_obj_t *home_time_label;
     // 根据小时和分钟更新数字图片
     // 更新小时显示
     int hour_tens = g_current_time.hour / 10;
@@ -535,6 +563,13 @@ void time_ui_update_callback(void)
         last_minute_units = minute_units;
     }
 
+    if (home_time_label) {
+        char time_text[8];
+        snprintf(time_text, sizeof(time_text), "%02d:%02d",
+                 g_current_time.hour, g_current_time.minute);
+        lv_label_set_text(home_time_label, time_text);
+    }
+
 
 
     // 更新待机界面秒
@@ -556,6 +591,7 @@ void time_ui_update_callback(void)
             snprintf(year_text, sizeof(year_text), "%d", g_current_time.year);
             lv_label_set_text(ui_Label_year, year_text);
         }
+        last_year = g_current_time.year;
     }
     // 更新月日显示
     if (g_current_time.month != last_month || g_current_time.day != last_day) {
@@ -564,6 +600,8 @@ void time_ui_update_callback(void)
             snprintf(date_text, sizeof(date_text), "%02d%02d", g_current_time.month, g_current_time.day);
             lv_label_set_text(ui_Label_day, date_text);
         }
+        last_month = g_current_time.month;
+        last_day = g_current_time.day;
     }
 
    // 更新蓝牙和网络图标（仅在状态变化时更新）
@@ -600,6 +638,7 @@ void time_ui_update_callback(void)
         last_pan_connected = g_pan_connected;
     }
 
+    update_home_status_meta();
 
 }
 
@@ -800,6 +839,8 @@ void weather_ui_update_callback(void)
             LOG_I("last_update_text:%s",last_update_text);
         }
     }
+
+    update_home_status_meta();
 }
 
 

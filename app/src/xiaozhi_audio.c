@@ -365,7 +365,7 @@ void xz_speaker(int on)
 #ifdef XIAOZHI_USING_MQTT
 static void xz_button_event_handler(int32_t pin, button_action_t action)
 {
-    lv_display_trigger_activity(NULL);
+    xiaozhi_ui_trigger_activity();
     gui_pm_fsm(GUI_PM_ACTION_WAKEUP); // 唤醒设备
     rt_kprintf("in mqtt button handle2\n");
     // 如果当前处于KWS模式，则退出KWS模式
@@ -385,13 +385,9 @@ static void xz_button_event_handler(int32_t pin, button_action_t action)
         if (action == BUTTON_PRESSED)
         {
             
-            lv_obj_t *now_screen = lv_screen_active();
             rt_kprintf("pressed\r\n");
             rt_kprintf("mqtt按键->对话\n");
-            if (now_screen == standby_screen)
-            {
-                ui_switch_to_xiaozhi_screen();
-            }
+            ui_switch_to_xiaozhi_screen();
             if (mqtt_g_state == kDeviceStateUnknown) // goodby唤醒
             {
                 mqtt_hello(&g_xz_context);

@@ -26,6 +26,7 @@
 #include "../kws/app_recorder_process.h"
 #include "../board/board_hardware.h"
 #include "xiaozhi_screen.h"
+#include "ui/home/home_screen.h"
 #include "charge.h"
 #include "bt_pan_ota.h"
 
@@ -78,14 +79,23 @@ typedef enum {
     UI_MSG_SHOW_UPDATE_CONFIRM,
     UI_MSG_UPDATE_LATEST_VERSION,
     UI_MSG_CONFIRM_BUTTON_EVENT,
-    UI_MSG_REINIT_AUDIO  
+    UI_MSG_REINIT_AUDIO,
+    UI_MSG_TRIGGER_ACTIVITY,
+    UI_MSG_START_SLEEP_TIMER
 
 } ui_msg_type_t;
+
+#define UI_MSG_TEXT_MAX 512
 
 // 定义UI消息结构
 typedef struct {
     ui_msg_type_t type;
-    char *data;
+    union {
+        char text[UI_MSG_TEXT_MAX];
+        int int_value;
+        uint8_t u8_value;
+        BOOL bool_value;
+    } payload;
 } ui_msg_t;
 rt_mq_t ui_msg_queue = RT_NULL;
 
@@ -182,6 +192,10 @@ static lv_obj_t *seqimg;
 static lv_obj_t *global_img_ble;
 
 lv_font_t *font_medium;
+static lv_font_t *home_time_font = NULL;
+static lv_font_t *home_meta_font = NULL;
+static lv_font_t *home_label_font = NULL;
+static lv_font_t *home_status_font = NULL;
 
 
 /*待机画面*/
@@ -223,6 +237,8 @@ lv_obj_t *weather_bgimg;//天气背景图片
 lv_obj_t *weather_icon;//天气图标
 lv_obj_t *ui_Image_calendar;//日历图标
 lv_obj_t *standby_screen = NULL;//待机界面
+lv_obj_t *home_time_label = NULL;//首页顶部时间
+lv_obj_t *home_meta_label = NULL;//首页顶部日期天气
 lv_obj_t *ui_Label_ip = NULL;//地址和温度标签
 lv_obj_t *last_time = NULL;//上次更新天气图标
 lv_obj_t *ui_Label_year =NULL;//年份
@@ -286,7 +302,23 @@ static void set_charge_icon()
     rt_err_t err = rt_charge_get_detect_status(&current_charge_status);
     if (err == RT_EOK) 
     {
-        xiaozhi_ui_update_charge_status(current_charge_status);
+        bool should_show_charging = current_charge_status && (g_battery_level < 100);
+
+        if (charging_icon)
+        {
+            if (should_show_charging)
+                lv_obj_clear_flag(charging_icon, LV_OBJ_FLAG_HIDDEN);
+            else
+                lv_obj_add_flag(charging_icon, LV_OBJ_FLAG_HIDDEN);
+        }
+
+        if (standby_charging_icon)
+        {
+            if (should_show_charging)
+                lv_obj_clear_flag(standby_charging_icon, LV_OBJ_FLAG_HIDDEN);
+            else
+                lv_obj_add_flag(standby_charging_icon, LV_OBJ_FLAG_HIDDEN);
+        }
     } 
     else 
     {
@@ -347,22 +379,45 @@ static const uint16_t brigtness_tb[] =
     LCD_BRIGHTNESS_MAX,
 };
 
-// 文本复制函数
-static char* ui_strdup(const char* str) {
-    if (str == RT_NULL) return RT_NULL;
-    size_t len = strlen(str) + 1;
-    char* copy = (char*)rt_malloc(len);
-    if (copy) {
-        memcpy(copy, str, len);
-    }
-    return copy;
+static void ui_msg_init(ui_msg_t *msg, ui_msg_type_t type)
+{
+    memset(msg, 0, sizeof(*msg));
+    msg->type = type;
 }
 
+static void ui_msg_set_text(ui_msg_t *msg, const char *text)
+{
+    if (text == RT_NULL)
+    {
+        msg->payload.text[0] = '\0';
+        return;
+    }
 
-// 文本释放函数
-static void ui_free(char* str) {
-    if (str) {
-        rt_free(str);
+    strncpy(msg->payload.text, text, UI_MSG_TEXT_MAX - 1);
+    msg->payload.text[UI_MSG_TEXT_MAX - 1] = '\0';
+}
+
+static rt_err_t ui_msg_send(const ui_msg_t *msg)
+{
+    if (ui_msg_queue == RT_NULL)
+    {
+        return -RT_ERROR;
+    }
+
+    return rt_mq_send(ui_msg_queue, (void *)msg, sizeof(ui_msg_t));
+}
+
+static void ui_restart_sleep_timer(rt_uint32_t timeout_ms)
+{
+    if (ui_sleep_timer != NULL)
+    {
+        lv_timer_delete(ui_sleep_timer);
+        ui_sleep_timer = NULL;
+    }
+
+    if (g_pan_connected && timeout_ms > 0)
+    {
+        ui_sleep_timer = lv_timer_create(ui_sleep_callback, timeout_ms, NULL);
     }
 }
 
@@ -381,8 +436,11 @@ void ui_sleep_callback(lv_timer_t *timer)
         kws_demo();
     } 
     show_sleep_countdown_and_sleep();
-    lv_timer_delete(ui_sleep_timer);
     ui_sleep_timer = NULL;
+    if (timer != NULL)
+    {
+        lv_timer_delete(timer);
+    }
 }
 
 void ui_update_real_weather_and_time(void);
@@ -536,7 +594,7 @@ static lv_obj_t* create_tip_label(lv_obj_t* parent, const char* tips, uint8_t ro
 
     lv_obj_t* label = lv_label_create(obj);
     lv_obj_add_style(label, &style, 0);
-    lv_label_set_text_fmt(label, tips);
+    lv_label_set_text(label, tips ? tips : "");
     lv_obj_center(label);
     return label;
 }
@@ -838,254 +896,53 @@ rt_err_t xiaozhi_ui_obj_init()
     lv_coord_t scr_width = lv_disp_get_hor_res(NULL);
     lv_coord_t scr_height = lv_disp_get_ver_res(NULL);
    
-    standby_screen = lv_obj_create(NULL);
-    lv_obj_clear_flag(standby_screen, LV_OBJ_FLAG_SCROLLABLE);      /// Flags
-    lv_obj_set_style_bg_color(standby_screen, lv_color_hex(0x000000), 0);//黑色
+    {
+        xiaozhi_home_screen_config_t home_config;
+        xiaozhi_home_screen_refs_t home_refs;
 
-    lv_obj_t *standby_header_row = lv_obj_create(standby_screen);
-    lv_obj_remove_flag(standby_header_row, LV_OBJ_FLAG_SCROLLABLE);
-    lv_obj_set_size(standby_header_row, scr_width, SCALE_DPX(40));
-    lv_obj_set_style_bg_opa(standby_header_row, LV_OPA_0, 0);
-    lv_obj_set_style_border_width(standby_header_row, 0, 0);
-    lv_obj_set_flex_flow(standby_header_row, LV_FLEX_FLOW_ROW);
-    lv_obj_set_flex_align(standby_header_row, LV_FLEX_ALIGN_SPACE_BETWEEN,
-                        LV_FLEX_ALIGN_CENTER, LV_FLEX_ALIGN_CENTER);
-    lv_obj_set_style_bg_color(standby_header_row, lv_color_hex(0x000000), LV_STATE_DEFAULT);
-    lv_obj_set_style_bg_opa(standby_header_row, LV_OPA_30, LV_STATE_DEFAULT);
-    #if USING_TOUCH_SWITCH
-    lv_obj_add_event_cb(standby_header_row, header_row_event_handler, LV_EVENT_ALL, NULL);
-    #endif
+        home_config.scale = g_scale;
+        home_config.battery_level = g_battery_level;
+        home_config.time_font = home_time_font;
+        home_config.meta_font = home_meta_font;
+        home_config.label_font = home_label_font;
+        home_config.status_font = home_status_font;
+        home_config.title_style = &style;
+        home_config.body_style = &style2;
+        home_config.battery_font = font_medium;
+        home_config.header_event_cb = NULL;
+        home_config.tile_event_cb = NULL;
+        home_config.enable_header_event = false;
+        home_config.enable_tile_event = false;
 
-    img_emoji = lv_img_create(standby_screen);
-    LV_IMAGE_DECLARE(sleepy2);
-    LV_IMAGE_DECLARE(funny2);
-    lv_img_set_src(img_emoji, &sleepy2);//初始化提示小智还未连接
-    lv_obj_set_width(img_emoji, LV_SIZE_CONTENT);   /// 1
-    lv_obj_set_height(img_emoji, LV_SIZE_CONTENT);    /// 1
-    lv_obj_set_x(img_emoji, (int)(104 * g_scale));
-    lv_obj_set_y(img_emoji, (int)(-123 * g_scale));
-    lv_obj_set_align(img_emoji, LV_ALIGN_CENTER);
-    lv_obj_add_flag(img_emoji, LV_OBJ_FLAG_ADV_HITTEST);     /// Flags
-    lv_obj_clear_flag(img_emoji, LV_OBJ_FLAG_SCROLLABLE);      /// Flags
-    lv_img_set_zoom(img_emoji, (int)(LV_SCALE_NONE * g_scale)); // 根据缩放因子缩放
+        if (xiaozhi_home_screen_create(&home_config, &home_refs) != RT_EOK)
+        {
+            return -RT_ERROR;
+        }
 
-    hour_tens_img = lv_img_create(standby_screen);
-    LV_IMAGE_DECLARE(img_1);
-    lv_img_set_src(hour_tens_img, &img_1);
-    lv_obj_set_width(hour_tens_img, LV_SIZE_CONTENT);   /// 1
-    lv_obj_set_height(hour_tens_img, LV_SIZE_CONTENT);    /// 1
-    lv_obj_set_x(hour_tens_img, (int)(-142 * g_scale));
-    lv_obj_set_y(hour_tens_img, (int)(-163 * g_scale));
-    lv_obj_set_align(hour_tens_img, LV_ALIGN_CENTER);
-    lv_obj_add_flag(hour_tens_img, LV_OBJ_FLAG_ADV_HITTEST);     /// Flags
-    lv_obj_clear_flag(hour_tens_img, LV_OBJ_FLAG_SCROLLABLE);      /// Flags
-    lv_img_set_zoom(hour_tens_img, (int)(204 * g_scale));
-
-    hour_units_img = lv_img_create(standby_screen);
-    LV_IMAGE_DECLARE(img_2);
-    lv_img_set_src(hour_units_img, &img_2);
-    lv_obj_set_width(hour_units_img, LV_SIZE_CONTENT);   /// 1
-    lv_obj_set_height(hour_units_img, LV_SIZE_CONTENT);    /// 1
-    lv_obj_set_x(hour_units_img, (int)(-73 * g_scale));
-    lv_obj_set_y(hour_units_img, (int)(-163 * g_scale));
-    lv_obj_set_align(hour_units_img, LV_ALIGN_CENTER);
-    lv_obj_add_flag(hour_units_img, LV_OBJ_FLAG_ADV_HITTEST);     /// Flags
-    lv_obj_clear_flag(hour_units_img, LV_OBJ_FLAG_SCROLLABLE);      /// Flags
-    lv_img_set_zoom(hour_units_img, (int)(204 * g_scale));
-
-    minute_tens_img = lv_img_create(standby_screen);
-        LV_IMAGE_DECLARE(img_3);
-
-    lv_img_set_src(minute_tens_img, &img_3);
-    lv_obj_set_width(minute_tens_img, LV_SIZE_CONTENT);   /// 1
-    lv_obj_set_height(minute_tens_img, LV_SIZE_CONTENT);    /// 1
-    lv_obj_set_x(minute_tens_img, (int)(-142 * g_scale));
-    lv_obj_set_y(minute_tens_img, (int)(-66 * g_scale));
-    lv_obj_set_align(minute_tens_img, LV_ALIGN_CENTER);
-    lv_obj_add_flag(minute_tens_img, LV_OBJ_FLAG_ADV_HITTEST);     /// Flags
-    lv_obj_clear_flag(minute_tens_img, LV_OBJ_FLAG_SCROLLABLE);      /// Flags
-    lv_img_set_zoom(minute_tens_img, (int)(204 * g_scale));
-
-    minute_units_img = lv_img_create(standby_screen);
-            LV_IMAGE_DECLARE(img_4);
-
-    lv_img_set_src(minute_units_img, &img_4);
-    lv_obj_set_width(minute_units_img, LV_SIZE_CONTENT);   /// 1
-    lv_obj_set_height(minute_units_img, LV_SIZE_CONTENT);    /// 1
-    lv_obj_set_x(minute_units_img, (int)(-73 * g_scale));
-    lv_obj_set_y(minute_units_img, (int)(-66 * g_scale));
-    lv_obj_set_align(minute_units_img, LV_ALIGN_CENTER);
-    lv_obj_add_flag(minute_units_img, LV_OBJ_FLAG_ADV_HITTEST);     /// Flags
-    lv_obj_clear_flag(minute_units_img, LV_OBJ_FLAG_SCROLLABLE);      /// Flags
-    lv_img_set_zoom(minute_units_img, (int)(204 * g_scale));
-
-    bluetooth_icon = lv_img_create(standby_screen);
-        LV_IMAGE_DECLARE(ble_icon_img);
-
-    lv_img_set_src(bluetooth_icon, &ble_icon_img);
-    lv_obj_set_width(bluetooth_icon, LV_SIZE_CONTENT);   /// 1
-    lv_obj_set_height(bluetooth_icon, LV_SIZE_CONTENT);    /// 1
-    lv_obj_set_x(bluetooth_icon, (int)(-134 * g_scale));
-    lv_obj_set_y(bluetooth_icon, (int)(133 * g_scale));
-    lv_obj_set_align(bluetooth_icon, LV_ALIGN_CENTER);
-    lv_obj_add_flag(bluetooth_icon, LV_OBJ_FLAG_ADV_HITTEST);     /// Flags
-    lv_obj_clear_flag(bluetooth_icon, LV_OBJ_FLAG_SCROLLABLE);      /// Flags
-    lv_img_set_zoom(bluetooth_icon, (int)(LV_SCALE_NONE * g_scale));
-
-    network_icon = lv_img_create(standby_screen);
-        LV_IMAGE_DECLARE(network_icon_img);
-
-    lv_img_set_src(network_icon, &network_icon_img);
-    lv_obj_set_width(network_icon, LV_SIZE_CONTENT);   /// 1
-    lv_obj_set_height(network_icon, LV_SIZE_CONTENT);    /// 1
-    lv_obj_set_x(network_icon, (int)(0 * g_scale));
-    lv_obj_set_y(network_icon, (int)(133 * g_scale));
-    lv_obj_set_align(network_icon, LV_ALIGN_CENTER);
-    lv_obj_add_flag(network_icon, LV_OBJ_FLAG_ADV_HITTEST);     /// Flags
-    lv_obj_clear_flag(network_icon, LV_OBJ_FLAG_SCROLLABLE);      /// Flags
-    lv_img_set_zoom(network_icon, (int)(384 * g_scale));
-
-    // 电池环形
-    battery_arc = lv_arc_create(standby_screen);
-    lv_obj_set_size(battery_arc, (int)(60 * g_scale), (int)(60 * g_scale)); // 设置圆弧大小
-    lv_obj_set_x(battery_arc, (int)(134 * g_scale));
-    lv_obj_set_y(battery_arc, (int)(133 * g_scale));
-    lv_obj_set_align(battery_arc, LV_ALIGN_CENTER);
-    lv_arc_set_rotation(battery_arc, 270); // 从顶部开始
-    lv_arc_set_bg_angles(battery_arc, 0, 360); // 背景圆环完整
-    lv_arc_set_value(battery_arc, g_battery_level); // 全局电量
-    lv_obj_remove_style(battery_arc, NULL, LV_PART_KNOB); // 移除旋钮
-    lv_obj_set_style_arc_color(battery_arc, lv_color_hex(0x333333), LV_PART_MAIN); // 背景圆环颜色
-    lv_obj_set_style_arc_color(battery_arc, lv_color_hex(0x00CC00), LV_PART_INDICATOR); // 电量颜色(绿色)
-    lv_obj_set_style_arc_width(battery_arc, (int)(8 * g_scale), LV_PART_MAIN); // 背景圆环宽度
-    lv_obj_set_style_arc_width(battery_arc, (int)(6 * g_scale), LV_PART_INDICATOR); // 电量指示宽度
-    // 电池电量百分比文本
-    battery_percent_label = lv_label_create(battery_arc);
-    lv_label_set_text_fmt(battery_percent_label, "%d%%", g_battery_level);
-    lv_obj_set_style_text_color(battery_percent_label, lv_color_white(), 0);
-    lv_obj_set_style_text_font(battery_percent_label, font_medium, 0);
-    lv_obj_align(battery_percent_label, LV_ALIGN_CENTER, 0, 0); // 在圆弧中心
-
-    standby_charging_icon = lv_img_create(battery_arc);
-    lv_img_set_src(standby_charging_icon, &cdian2);
-    lv_obj_set_size(standby_charging_icon, 24, 24); // 设置合适的尺寸
-    lv_obj_align(standby_charging_icon, LV_ALIGN_CENTER, 0, 0); // 在圆弧中心对齐
-    lv_obj_add_flag(standby_charging_icon, LV_OBJ_FLAG_HIDDEN); // 初始隐藏
-
-
-//天气
-    weather_bgimg = lv_img_create(standby_screen);
-    LV_IMAGE_DECLARE(strip);
-    lv_img_set_src(weather_bgimg, &strip);
-    lv_obj_set_width(weather_bgimg, LV_SIZE_CONTENT);   /// 1
-    lv_obj_set_height(weather_bgimg, LV_SIZE_CONTENT);    /// 1
-    lv_obj_set_x(weather_bgimg, (int)(70 * g_scale));
-    lv_obj_set_y(weather_bgimg, (int)(52 * g_scale));
-    lv_obj_set_align(weather_bgimg, LV_ALIGN_CENTER);
-    lv_obj_add_flag(weather_bgimg, LV_OBJ_FLAG_ADV_HITTEST);     /// Flags
-    lv_obj_clear_flag(weather_bgimg, LV_OBJ_FLAG_SCROLLABLE);      /// Flags
-    lv_img_set_zoom(weather_bgimg, (int)(550 * g_scale));
-
-    weather_icon = lv_img_create(standby_screen);
-    LV_IMAGE_DECLARE(sunny);
-
-    lv_img_set_src(weather_icon, &sunny);
-    lv_obj_set_width(weather_icon, LV_SIZE_CONTENT);   /// 1
-    lv_obj_set_height(weather_icon, LV_SIZE_CONTENT);    /// 1
-    lv_obj_set_x(weather_icon, (int)(0 * g_scale));
-    lv_obj_set_y(weather_icon, (int)(50 * g_scale));
-    lv_obj_set_align(weather_icon, LV_ALIGN_CENTER);
-    lv_obj_add_flag(weather_icon, LV_OBJ_FLAG_ADV_HITTEST);     /// Flags
-    lv_obj_clear_flag(weather_icon, LV_OBJ_FLAG_SCROLLABLE);      /// Flags
-    lv_img_set_zoom(weather_icon, (int)(LV_SCALE_NONE * g_scale)); // 根据缩放因子缩放
-
-    ui_Label_ip = lv_label_create(standby_screen);
-    lv_obj_set_width(ui_Label_ip, LV_SIZE_CONTENT);   /// 1
-    lv_obj_set_height(ui_Label_ip, LV_SIZE_CONTENT);    /// 1
-    lv_obj_set_x(ui_Label_ip, (int)(80 * g_scale));
-    lv_obj_set_y(ui_Label_ip, (int)(31 * g_scale));
-    lv_obj_set_align(ui_Label_ip, LV_ALIGN_CENTER);
-    lv_label_set_text(ui_Label_ip, "IP.00°");
-    lv_obj_add_style(ui_Label_ip, &style2, 0);
-
-
-    last_time = lv_label_create(standby_screen);
-    lv_obj_set_width(last_time, LV_SIZE_CONTENT);   /// 1
-    lv_obj_set_height(last_time, LV_SIZE_CONTENT);    /// 1
-    lv_obj_set_x(last_time, (int)(80 * g_scale));
-    lv_obj_set_y(last_time, (int)(69 * g_scale));
-    lv_obj_set_align(last_time, LV_ALIGN_CENTER);
-    lv_label_set_text(last_time, "00:00");
-    lv_obj_add_style(last_time, &style2, 0);
-
-
-//日历
-    ui_Image_calendar = lv_img_create(standby_screen);
-    LV_IMAGE_DECLARE(calendar);
-    lv_img_set_src(ui_Image_calendar, &calendar);
-    lv_obj_set_width(ui_Image_calendar, LV_SIZE_CONTENT);   /// 1
-    lv_obj_set_height(ui_Image_calendar, LV_SIZE_CONTENT);    /// 1
-    lv_obj_set_x(ui_Image_calendar, (int)(-107 * g_scale));
-    lv_obj_set_y(ui_Image_calendar, (int)(39 * g_scale));
-    lv_obj_set_align(ui_Image_calendar, LV_ALIGN_CENTER);
-    lv_obj_add_flag(ui_Image_calendar, LV_OBJ_FLAG_ADV_HITTEST);     /// Flags
-    lv_obj_clear_flag(ui_Image_calendar, LV_OBJ_FLAG_SCROLLABLE);      /// Flags
-    lv_img_set_zoom(ui_Image_calendar,(int)(320 * g_scale));
-
-    ui_Label_year = lv_label_create(standby_screen);
-    lv_obj_set_width(ui_Label_year, LV_SIZE_CONTENT);   /// 1
-    lv_obj_set_height(ui_Label_year, LV_SIZE_CONTENT);    /// 1
-    lv_obj_set_x(ui_Label_year, (int)(-109 * g_scale));
-    lv_obj_set_y(ui_Label_year, (int)(49 * g_scale));
-    lv_obj_set_align(ui_Label_year, LV_ALIGN_CENTER);
-    lv_label_set_text(ui_Label_year, "2025");
-        lv_obj_add_style(ui_Label_year, &style, 0);
-
-
-     ui_Label_day = lv_label_create(standby_screen);
-    lv_obj_set_width(ui_Label_day, LV_SIZE_CONTENT);   /// 1
-    lv_obj_set_height(ui_Label_day, LV_SIZE_CONTENT);    /// 1
-    lv_obj_set_x(ui_Label_day, (int)(-109 * g_scale));
-    lv_obj_set_y(ui_Label_day, (int)(74 * g_scale));
-    lv_obj_set_align(ui_Label_day, LV_ALIGN_CENTER);
-    lv_label_set_text(ui_Label_day, "0801");
-        lv_obj_add_style(ui_Label_day, &style, 0);
-
-//秒
-     ui_Label_second = lv_label_create(standby_screen);
-    lv_obj_set_width(ui_Label_second, LV_SIZE_CONTENT);   /// 1
-    lv_obj_set_height(ui_Label_second, LV_SIZE_CONTENT);    /// 1
-    lv_obj_set_x(ui_Label_second, (int)(-8 * g_scale));
-    lv_obj_set_y(ui_Label_second, (int)(-48 * g_scale));
-    lv_obj_set_align(ui_Label_second, LV_ALIGN_CENTER);
-    lv_label_set_text(ui_Label_second, "00");
-    lv_obj_add_style(ui_Label_second, &style, 0);
-
-    ui_Image_second = lv_img_create(standby_screen);
-    LV_IMAGE_DECLARE(second);
-    lv_img_set_src(ui_Image_second, &second);
-    lv_obj_set_width(ui_Image_second, LV_SIZE_CONTENT);   /// 1
-    lv_obj_set_height(ui_Image_second, LV_SIZE_CONTENT);    /// 1
-    lv_obj_set_x(ui_Image_second, (int)(-7 * g_scale));
-    lv_obj_set_y(ui_Image_second, (int)(-47 * g_scale));
-    lv_obj_set_align(ui_Image_second, LV_ALIGN_CENTER);
-    lv_obj_add_flag(ui_Image_second, LV_OBJ_FLAG_ADV_HITTEST);     /// Flags
-    lv_obj_clear_flag(ui_Image_second, LV_OBJ_FLAG_SCROLLABLE);      /// Flags
-    lv_img_set_zoom(ui_Image_second,(int)(300 * g_scale));
-
-
-    ui_Label3 = lv_label_create(standby_screen);
-    lv_obj_set_width(ui_Label3, LV_SIZE_CONTENT);   /// 1
-    lv_obj_set_height(ui_Label3, LV_SIZE_CONTENT);    /// 1
-    lv_obj_set_x(ui_Label3, (int)(2 * g_scale));
-    lv_obj_set_y(ui_Label3, (int)(189 * g_scale));
-    lv_obj_set_align(ui_Label3, LV_ALIGN_CENTER);
-    lv_obj_add_style(ui_Label3, &style2, 0);
-    lv_label_set_text(ui_Label3, "等待连接");
-
-    LV_IMAGE_DECLARE(ble);
-    LV_IMAGE_DECLARE(cdian2);
-    LV_IMAGE_DECLARE(ble_close);
+        standby_screen = home_refs.screen;
+        home_time_label = home_refs.time_label;
+        home_meta_label = home_refs.meta_label;
+        img_emoji = home_refs.img_emoji;
+        hour_tens_img = home_refs.hour_tens_img;
+        hour_units_img = home_refs.hour_units_img;
+        minute_tens_img = home_refs.minute_tens_img;
+        minute_units_img = home_refs.minute_units_img;
+        bluetooth_icon = home_refs.bluetooth_icon;
+        network_icon = home_refs.network_icon;
+        battery_arc = home_refs.battery_arc;
+        battery_percent_label = home_refs.battery_percent_label;
+        standby_charging_icon = home_refs.standby_charging_icon;
+        weather_icon = home_refs.weather_icon;
+        ui_Label_ip = home_refs.ui_Label_ip;
+        last_time = home_refs.last_time;
+        ui_Image_calendar = home_refs.ui_Image_calendar;
+        ui_Label_year = home_refs.ui_Label_year;
+        ui_Label_day = home_refs.ui_Label_day;
+        ui_Label_second = home_refs.ui_Label_second;
+        ui_Image_second = home_refs.ui_Image_second;
+        ui_Label3 = home_refs.ui_Label3;
+        weather_bgimg = NULL;
+    }
 
 
 
@@ -1343,20 +1200,11 @@ rt_err_t xiaozhi_ui_obj_init()
 void xiaozhi_ui_update_volume(int volume)
 {
     if (ui_msg_queue != RT_NULL) {
-        ui_msg_t* msg = (ui_msg_t*)rt_malloc(sizeof(ui_msg_t));
-        if (msg != RT_NULL) {
-            msg->type = UI_MSG_VOLUME_UPDATE;
-            msg->data = (char*)rt_malloc(sizeof(int));
-            if (msg->data != RT_NULL) {
-                *((int*)msg->data) = volume;
-                if (rt_mq_send(ui_msg_queue, &msg, sizeof(ui_msg_t*)) != RT_EOK) {
-                    LOG_E("Failed to send volume update UI message");
-                    rt_free(msg->data);
-                    rt_free(msg);
-                }
-            } else {
-                rt_free(msg);
-            }
+        ui_msg_t msg;
+        ui_msg_init(&msg, UI_MSG_VOLUME_UPDATE);
+        msg.payload.int_value = volume;
+        if (ui_msg_send(&msg) != RT_EOK) {
+            LOG_E("Failed to send volume update UI message");
         }
     }
 }
@@ -1364,20 +1212,11 @@ void xiaozhi_ui_update_volume(int volume)
 void xiaozhi_ui_update_brightness(int brightness)
 {
     if (ui_msg_queue != RT_NULL) {
-        ui_msg_t* msg = (ui_msg_t*)rt_malloc(sizeof(ui_msg_t));
-        if (msg != RT_NULL) {
-            msg->type = UI_MSG_BRIGHTNESS_UPDATE;
-            msg->data = (char*)rt_malloc(sizeof(int));
-            if (msg->data != RT_NULL) {
-                *((int*)msg->data) = brightness;
-                if (rt_mq_send(ui_msg_queue, &msg, sizeof(ui_msg_t*)) != RT_EOK) {
-                    LOG_E("Failed to send brightness update UI message");
-                    rt_free(msg->data);
-                    rt_free(msg);
-                }
-            } else {
-                rt_free(msg);
-            }
+        ui_msg_t msg;
+        ui_msg_init(&msg, UI_MSG_BRIGHTNESS_UPDATE);
+        msg.payload.int_value = brightness;
+        if (ui_msg_send(&msg) != RT_EOK) {
+            LOG_E("Failed to send brightness update UI message");
         }
     }
 }
@@ -1386,21 +1225,11 @@ void xiaozhi_ui_update_charge_status(uint8_t is_charging)
 {
     if (ui_msg_queue != RT_NULL) 
     {
-        ui_msg_t* msg = (ui_msg_t*)rt_malloc(sizeof(ui_msg_t));
-        if (msg != RT_NULL) {
-            msg->type = UI_MSG_CHARGE_STATUS_CHANGED;
-            msg->data = (char*)rt_malloc(sizeof(uint8_t));
-            if (msg->data != RT_NULL) {
-                *((uint8_t*)msg->data) = is_charging;
-                if (rt_mq_send(ui_msg_queue, &msg, sizeof(ui_msg_t*)) != RT_EOK) {
-                    LOG_E("Failed to send charge status update UI message");
-                    rt_free(msg->data);
-                    rt_free(msg);
-                }
-            } else {
-                rt_free(msg);
-               
-            }
+        ui_msg_t msg;
+        ui_msg_init(&msg, UI_MSG_CHARGE_STATUS_CHANGED);
+        msg.payload.u8_value = is_charging;
+        if (ui_msg_send(&msg) != RT_EOK) {
+            LOG_E("Failed to send charge status update UI message");
         }
     }
     else 
@@ -1413,17 +1242,12 @@ void xiaozhi_ui_update_standby_emoji(char *string) // emoji
 {
     if(ui_msg_queue != RT_NULL)
     {
-        ui_msg_t* msg = (ui_msg_t*)rt_malloc(sizeof(ui_msg_t));
-        if(msg != RT_NULL)
+        ui_msg_t msg;
+        ui_msg_init(&msg, UI_MSG_STANDBY_EMOJI);
+        ui_msg_set_text(&msg, string);
+        if(ui_msg_send(&msg) != RT_EOK)
         {
-            msg->type = UI_MSG_STANDBY_EMOJI;
-            msg->data = ui_strdup(string);
-            if(rt_mq_send(ui_msg_queue, &msg, sizeof(ui_msg_t*)) != RT_EOK)
-            {
-                LOG_E("Failed to send standby emoji UI message");
-                rt_free(msg->data);
-                rt_free(msg);
-            }
+            LOG_E("Failed to send standby emoji UI message");
         }
     }
 }
@@ -1431,14 +1255,10 @@ void ui_update_real_weather_and_time(void)
 {
             // 异步发送消息更新天气和时间
         if (ui_msg_queue != RT_NULL) {
-            ui_msg_t* msg = (ui_msg_t*)rt_malloc(sizeof(ui_msg_t));
-            if (msg != RT_NULL) {
-                msg->type = UI_MSG_UPDATE_WEATHER_AND_TIME;
-                msg->data = RT_NULL;
-                if (rt_mq_send(ui_msg_queue, &msg, sizeof(ui_msg_t*)) != RT_EOK) {
-                    LOG_E("Failed to send weather/time update message");
-                    rt_free(msg);
-                }
+            ui_msg_t msg;
+            ui_msg_init(&msg, UI_MSG_UPDATE_WEATHER_AND_TIME);
+            if (ui_msg_send(&msg) != RT_EOK) {
+                LOG_E("Failed to send weather/time update message");
             }
         }
     
@@ -1446,32 +1266,24 @@ void ui_update_real_weather_and_time(void)
 
 void ui_swith_to_standby_screen(void)
 {
-                  if (ui_msg_queue != RT_NULL) {
-                  ui_msg_t* msg = (ui_msg_t*)rt_malloc(sizeof(ui_msg_t));
-                  if (msg != RT_NULL) {
-                      msg->type = UI_MSG_SWITCH_TO_STANDBY;
-                      msg->data = RT_NULL;
-                      if (rt_mq_send(ui_msg_queue, &msg, sizeof(ui_msg_t*)) != RT_EOK) {
-                          LOG_E("Failed to send switch to standby UI message");
-                          rt_free(msg);
-                      }
-                  }
-              }
+    if (ui_msg_queue != RT_NULL) {
+        ui_msg_t msg;
+        ui_msg_init(&msg, UI_MSG_SWITCH_TO_STANDBY);
+        if (ui_msg_send(&msg) != RT_EOK) {
+            LOG_E("Failed to send switch to standby UI message");
+        }
+    }
 }
 
 void ui_switch_to_xiaozhi_screen(void)
 {
     if (ui_msg_queue != RT_NULL) {
-                  ui_msg_t* msg = (ui_msg_t*)rt_malloc(sizeof(ui_msg_t));
-                  if (msg != RT_NULL) {
-                      msg->type = UI_MSG_SWITCH_TO_MAIN;
-                      msg->data = RT_NULL;
-                      if (rt_mq_send(ui_msg_queue, &msg, sizeof(ui_msg_t*)) != RT_EOK) {
-                          LOG_E("Failed to send switch to MAIN UI message");
-                          rt_free(msg);
-                      }
-                  }
-              }
+        ui_msg_t msg;
+        ui_msg_init(&msg, UI_MSG_SWITCH_TO_MAIN);
+        if (ui_msg_send(&msg) != RT_EOK) {
+            LOG_E("Failed to send switch to MAIN UI message");
+        }
+    }
 }
 
 
@@ -1488,15 +1300,10 @@ void update_xiaozhi_ui_time(void *parameter)
     // 使用消息队列发送更新UI的消息到UI线程
     extern rt_mq_t ui_msg_queue;
     if (ui_msg_queue != RT_NULL) {
-        ui_msg_t* msg = (ui_msg_t*)rt_malloc(sizeof(ui_msg_t));
-        if (msg != RT_NULL) {
-            msg->type = UI_MSG_TIME_UPDATE;  
-            msg->data = RT_NULL;  
-            
-            if (rt_mq_send(ui_msg_queue, &msg, sizeof(ui_msg_t*)) != RT_EOK) {
-                LOG_E("Failed to send time update UI message");
-                rt_free(msg);
-            }
+        ui_msg_t msg;
+        ui_msg_init(&msg, UI_MSG_TIME_UPDATE);
+        if (ui_msg_send(&msg) != RT_EOK) {
+            LOG_E("Failed to send time update UI message");
         }
     } else {
         // 如果没有消息队列，回退到直接调用（保持向后兼容）
@@ -1510,15 +1317,10 @@ void update_xiaozhi_ui_weather(void *parameter)
         // 使用消息队列发送更新UI的消息到UI线程
         extern rt_mq_t ui_msg_queue;
         if (ui_msg_queue != RT_NULL) {
-            ui_msg_t* msg = (ui_msg_t*)rt_malloc(sizeof(ui_msg_t));
-            if (msg != RT_NULL) {
-                msg->type = UI_MSG_WEATHER_UPDATE;  // 需要定义这个消息类型
-                msg->data = RT_NULL;  // 天气更新不需要额外数据
-                
-                if (rt_mq_send(ui_msg_queue, &msg, sizeof(ui_msg_t*)) != RT_EOK) {
-                    LOG_E("Failed to send weather update UI message");
-                    rt_free(msg);
-                }
+            ui_msg_t msg;
+            ui_msg_init(&msg, UI_MSG_WEATHER_UPDATE);
+            if (ui_msg_send(&msg) != RT_EOK) {
+                LOG_E("Failed to send weather update UI message");
             }
         } else {
             // 如果没有消息队列，回退到直接调用（保持向后兼容）
@@ -1531,17 +1333,12 @@ void xiaozhi_ui_chat_status(char *string) // top text
 {
     if(ui_msg_queue != RT_NULL)
     {
-        ui_msg_t* msg = (ui_msg_t*)rt_malloc(sizeof(ui_msg_t));
-        if(msg != RT_NULL)
+        ui_msg_t msg;
+        ui_msg_init(&msg, UI_MSG_CHAT_STATUS);
+        ui_msg_set_text(&msg, string);
+        if(ui_msg_send(&msg) != RT_EOK)
         {
-            msg->type = UI_MSG_CHAT_STATUS;
-            msg->data = ui_strdup(string);
-            if(rt_mq_send(ui_msg_queue, &msg, sizeof(ui_msg_t*)) != RT_EOK)
-            {
-                LOG_E("Failed to send UI message");
-                rt_free(msg->data);
-                rt_free(msg);
-            }
+            LOG_E("Failed to send UI message");
         }
     }
 }
@@ -1549,15 +1346,38 @@ void xiaozhi_ui_chat_status(char *string) // top text
 void xiaozhi_ui_reinit_audio(void)
 {
     if (ui_msg_queue != RT_NULL) {
-        ui_msg_t* msg = (ui_msg_t*)rt_malloc(sizeof(ui_msg_t));
-        if (msg != RT_NULL) {
-            msg->type = UI_MSG_REINIT_AUDIO;
-            msg->data = RT_NULL;
-            if (rt_mq_send(ui_msg_queue, &msg, sizeof(ui_msg_t*)) != RT_EOK) 
-            {
-                LOG_E("Failed to send reinit audio UI message");
-                rt_free(msg);
-            }
+        ui_msg_t msg;
+        ui_msg_init(&msg, UI_MSG_REINIT_AUDIO);
+        if (ui_msg_send(&msg) != RT_EOK) 
+        {
+            LOG_E("Failed to send reinit audio UI message");
+        }
+    }
+}
+
+void xiaozhi_ui_trigger_activity(void)
+{
+    if (ui_msg_queue != RT_NULL)
+    {
+        ui_msg_t msg;
+        ui_msg_init(&msg, UI_MSG_TRIGGER_ACTIVITY);
+        if (ui_msg_send(&msg) != RT_EOK)
+        {
+            LOG_E("Failed to send trigger activity UI message");
+        }
+    }
+}
+
+void xiaozhi_ui_start_sleep_timer(rt_uint32_t timeout_ms)
+{
+    if (ui_msg_queue != RT_NULL)
+    {
+        ui_msg_t msg;
+        ui_msg_init(&msg, UI_MSG_START_SLEEP_TIMER);
+        msg.payload.int_value = (int)timeout_ms;
+        if (ui_msg_send(&msg) != RT_EOK)
+        {
+            LOG_E("Failed to send sleep timer UI message");
         }
     }
 }
@@ -1566,17 +1386,12 @@ void xiaozhi_ui_standby_chat_output(char *string)
 {
     if(ui_msg_queue != RT_NULL)
     {
-        ui_msg_t* msg = (ui_msg_t*)rt_malloc(sizeof(ui_msg_t));
-        if(msg != RT_NULL)
+        ui_msg_t msg;
+        ui_msg_init(&msg, UI_MSG_STANDBY_CHAT_OUTPUT);
+        ui_msg_set_text(&msg, string);
+        if(ui_msg_send(&msg) != RT_EOK)
         {
-            msg->type = UI_MSG_STANDBY_CHAT_OUTPUT;
-            msg->data = ui_strdup(string);
-            if(rt_mq_send(ui_msg_queue, &msg, sizeof(ui_msg_t*)) != RT_EOK)
-            {
-                LOG_E("Failed to send standby_chat UI message");
-                rt_free(msg->data);
-                rt_free(msg);
-            }
+            LOG_E("Failed to send standby_chat UI message");
         }
     }
 }
@@ -1585,17 +1400,12 @@ void xiaozhi_ui_chat_output(char *string)
 {
     if(ui_msg_queue != RT_NULL)
     {
-        ui_msg_t* msg = (ui_msg_t*)rt_malloc(sizeof(ui_msg_t));
-        if(msg != RT_NULL)
+        ui_msg_t msg;
+        ui_msg_init(&msg, UI_MSG_CHAT_OUTPUT);
+        ui_msg_set_text(&msg, string);
+        if(ui_msg_send(&msg) != RT_EOK)
         {
-            msg->type = UI_MSG_CHAT_OUTPUT;
-            msg->data = ui_strdup(string);
-            if(rt_mq_send(ui_msg_queue, &msg, sizeof(ui_msg_t*)) != RT_EOK)
-            {
-                LOG_E("Failed to send UI message");
-                rt_free(msg->data);
-                rt_free(msg);
-            }
+            LOG_E("Failed to send UI message");
         }
     }
 }
@@ -1603,27 +1413,21 @@ void xiaozhi_ui_chat_output(char *string)
 static void switch_to_second_part(void *parameter)
 {
      if (ui_msg_queue != RT_NULL) {
-        ui_msg_t* msg = (ui_msg_t*)rt_malloc(sizeof(ui_msg_t));
-        if (msg != RT_NULL) {
-            msg->type = UI_MSG_TTS_SWITCH_PART;
-            msg->data = RT_NULL;  // 这个消息不需要数据
-            if (rt_mq_send(ui_msg_queue, &msg, sizeof(ui_msg_t*)) != RT_EOK) {
-                rt_free(msg);
-            }
+        ui_msg_t msg;
+        ui_msg_init(&msg, UI_MSG_TTS_SWITCH_PART);
+        if (ui_msg_send(&msg) != RT_EOK) {
+            LOG_E("Failed to send tts switch UI message");
         }
     }
 }
 void xiaozhi_ui_tts_output(char *string)
 {
      if (ui_msg_queue != RT_NULL) {
-        ui_msg_t* msg = (ui_msg_t*)rt_malloc(sizeof(ui_msg_t));
-        if (msg != RT_NULL) {
-            msg->type = UI_MSG_TTS_OUTPUT;
-            msg->data = ui_strdup(string);
-            if (rt_mq_send(ui_msg_queue, &msg, sizeof(ui_msg_t*)) != RT_EOK) {
-                ui_free(msg->data);
-                rt_free(msg);
-            }
+        ui_msg_t msg;
+        ui_msg_init(&msg, UI_MSG_TTS_OUTPUT);
+        ui_msg_set_text(&msg, string);
+        if (ui_msg_send(&msg) != RT_EOK) {
+            LOG_E("Failed to send tts output UI message");
         }
     }
 }
@@ -1632,17 +1436,12 @@ void xiaozhi_ui_update_emoji(char *string) // emoji
 {
     if(ui_msg_queue != RT_NULL)
     {
-        ui_msg_t* msg = (ui_msg_t*)rt_malloc(sizeof(ui_msg_t));
-        if(msg != RT_NULL)
+        ui_msg_t msg;
+        ui_msg_init(&msg, UI_MSG_UPDATE_EMOJI);
+        ui_msg_set_text(&msg, string);
+        if(ui_msg_send(&msg) != RT_EOK)
         {
-            msg->type = UI_MSG_UPDATE_EMOJI;
-            msg->data = ui_strdup(string);
-            if(rt_mq_send(ui_msg_queue, &msg, sizeof(ui_msg_t*)) != RT_EOK)
-            {
-                LOG_E("Failed to send UI message");
-                rt_free(msg->data);
-                rt_free(msg);
-            }
+            LOG_E("Failed to send UI message");
         }
     }
 }
@@ -1651,17 +1450,12 @@ void xiaozhi_ui_update_ble(char *string) // ble
 {
     if(ui_msg_queue != RT_NULL)
     {
-        ui_msg_t* msg = (ui_msg_t*)rt_malloc(sizeof(ui_msg_t));
-        if(msg != RT_NULL)
+        ui_msg_t msg;
+        ui_msg_init(&msg, UI_MSG_UPDATE_BLE);
+        ui_msg_set_text(&msg, string);
+        if(ui_msg_send(&msg) != RT_EOK)
         {
-            msg->type = UI_MSG_UPDATE_BLE;
-            msg->data = ui_strdup(string);
-            if(rt_mq_send(ui_msg_queue, &msg, sizeof(ui_msg_t*)) != RT_EOK)
-            {
-                LOG_E("Failed to send UI message");
-                rt_free(msg->data);
-                rt_free(msg);
-            }
+            LOG_E("Failed to send UI message");
         }
     }
 }
@@ -1670,28 +1464,13 @@ void xiaozhi_ui_update_ble(char *string) // ble
 void xiaozhi_ui_update_confirm_popup(ui_msg_type_t type, BOOL needs_update)
 {
     if (ui_msg_queue != RT_NULL) {
-        ui_msg_t* msg = (ui_msg_t*)rt_malloc(sizeof(ui_msg_t));
-        if (msg != RT_NULL) {
-            msg->type = type;
-            if (type == UI_MSG_SHOW_UPDATE_CONFIRM) {
-                msg->data = (char*)rt_malloc(sizeof(BOOL));
-                if (msg->data != RT_NULL) {
-                    *((BOOL*)msg->data) = needs_update;
-                    if (rt_mq_send(ui_msg_queue, &msg, sizeof(ui_msg_t*)) != RT_EOK) {
-                        LOG_E("Failed to send show update confirm UI message");
-                        rt_free(msg->data);
-                        rt_free(msg);
-                    }
-                } else {
-                    rt_free(msg);
-                }
-            } else {
-                msg->data = RT_NULL;
-                if (rt_mq_send(ui_msg_queue, &msg, sizeof(ui_msg_t*)) != RT_EOK) {
-                    LOG_E("Failed to send UI message");
-                    rt_free(msg);
-                }
-            }
+        ui_msg_t msg;
+        ui_msg_init(&msg, type);
+        if (type == UI_MSG_SHOW_UPDATE_CONFIRM) {
+            msg.payload.bool_value = needs_update;
+        }
+        if (ui_msg_send(&msg) != RT_EOK) {
+            LOG_E("Failed to send UI message");
         }
     }
 }
@@ -1700,17 +1479,12 @@ void xiaozhi_ui_update_latest_version(char *version)
 {
     if (ui_msg_queue != RT_NULL)
     {
-        ui_msg_t *msg = (ui_msg_t *)rt_malloc(sizeof(ui_msg_t));
-        if (msg != RT_NULL)
+        ui_msg_t msg;
+        ui_msg_init(&msg, UI_MSG_UPDATE_LATEST_VERSION);
+        ui_msg_set_text(&msg, version);
+        if (ui_msg_send(&msg) != RT_EOK)
         {
-            msg->type = UI_MSG_UPDATE_LATEST_VERSION;
-            msg->data = ui_strdup(version);
-            if (rt_mq_send(ui_msg_queue, &msg, sizeof(ui_msg_t *)) != RT_EOK)
-            {
-                LOG_E("Failed to send update latest version UI message");
-                rt_free(msg->data);
-                rt_free(msg);
-            }
+            LOG_E("Failed to send update latest version UI message");
         }
     }
 }
@@ -1720,28 +1494,12 @@ void xiaozhi_ui_update_confirm_button_event(bool is_update_button)
 {
     if (ui_msg_queue != RT_NULL)
     {
-        ui_msg_t *msg = (ui_msg_t *)rt_malloc(sizeof(ui_msg_t));
-        if (msg != RT_NULL)
+        ui_msg_t msg;
+        ui_msg_init(&msg, UI_MSG_CONFIRM_BUTTON_EVENT);
+        msg.payload.bool_value = is_update_button ? RT_TRUE : RT_FALSE;
+        if (ui_msg_send(&msg) != RT_EOK)
         {
-            msg->type = UI_MSG_CONFIRM_BUTTON_EVENT;
-            // 使用 data 字段存储按钮类型信息：1表示更新按钮，0表示取消按钮
-            msg->data = (char *)rt_malloc(sizeof(bool));
-            if (msg->data != RT_NULL)
-            {
-                memcpy(msg->data, &is_update_button, sizeof(bool));
-                if (rt_mq_send(ui_msg_queue, &msg, sizeof(ui_msg_t *)) !=
-                    RT_EOK)
-                {
-                    LOG_E("Failed to send update confirm button event UI "
-                          "message");
-                    rt_free(msg->data);
-                    rt_free(msg);
-                }
-            }
-            else
-            {
-                rt_free(msg);
-            }
+            LOG_E("Failed to send update confirm button event UI message");
         }
     }
 }
@@ -1799,7 +1557,8 @@ static void pm_event_handler(gui_pm_event_type_t event)
     }
     default:
     {
-        RT_ASSERT(0);
+        LOG_W("Unhandled PM event: %d", event);
+        break;
     }
     }
 }
@@ -1814,13 +1573,17 @@ void pm_ui_init()
     gpio_pin = GET_GPIOx_PIN(BSP_KEY1_PIN);
 
     wakeup_pin = HAL_HPAON_QueryWakeupPin(gpio, gpio_pin);
-    RT_ASSERT(wakeup_pin >= 0);
+    if (wakeup_pin < 0)
+    {
+        LOG_E("HAL_HPAON_QueryWakeupPin failed: %d", wakeup_pin);
+        return;
+    }
 
     lcd_device = rt_device_find(LCD_DEVICE_NAME);
     if (lcd_device == RT_NULL)
     {
-        LOG_I("lcd_device!=NULL!");
-        RT_ASSERT(0);
+        LOG_E("rt_device_find(%s) failed", LCD_DEVICE_NAME);
+        return;
     }
 #ifdef BSP_USING_PM
     pm_enable_pin_wakeup(wakeup_pin, AON_PIN_MODE_DOUBLE_EDGE);
@@ -1900,7 +1663,7 @@ void xiaozhi_ui_task(void *args)
     rt_sem_init(&update_ui_sema, "update_ui", 1, RT_IPC_FLAG_FIFO);
     rt_kprintf("xiaozhi_ui_task start\n");
     //初始化UI消息队列
-    ui_msg_queue = rt_mq_create("ui_msg", sizeof(ui_msg_t*), 20, RT_IPC_FLAG_FIFO);
+    ui_msg_queue = rt_mq_create("ui_msg", sizeof(ui_msg_t), 20, RT_IPC_FLAG_FIFO);
     if(ui_msg_queue == RT_NULL)
     {
         LOG_E("Failed to create UI message queue");
@@ -1909,18 +1672,26 @@ void xiaozhi_ui_task(void *args)
     // 初始化UI消息邮箱
     if (g_ui_task_mb == RT_NULL) {
         g_ui_task_mb = rt_mb_create("ui_mb", 8, RT_IPC_FLAG_FIFO);
-        RT_ASSERT(g_ui_task_mb != RT_NULL);
+        if (g_ui_task_mb == RT_NULL)
+        {
+            LOG_E("Failed to create UI mailbox");
+            return;
+        }
     }
+    rt_kprintf("xz_ui: mailbox ready\n");
     /* init littlevGL */
     ret = littlevgl2rtt_init("lcd");
     if (ret != RT_EOK)
     {
+        LOG_E("littlevgl2rtt_init failed: %d", ret);
         return;
     }
+    rt_kprintf("xz_ui: lvgl ready\n");
 
 
 #ifdef BSP_USING_PM
     pm_ui_init();
+    rt_kprintf("xz_ui: pm init done\n");
 #endif
     // 如果是低电量模式，简化初始化
     if (!g_skip_startup) 
@@ -1966,11 +1737,20 @@ void xiaozhi_ui_task(void *args)
         return; // 低电量模式下不执行后续的正常初始化
     }
 float scale = get_scale_factor();
+float home_scale = (float)lv_disp_get_hor_res(NULL) / 528.0f;
 
 const int medium_font_size = (int)(25 * scale + 0.5f);    // 秒显示
+const int home_time_font_size = (int)(34 * home_scale + 0.5f);
+const int home_meta_font_size = (int)(18 * home_scale + 0.5f);
+const int home_label_font_size = (int)(24 * home_scale + 0.5f);
+const int home_status_font_size = (int)(14 * home_scale + 0.5f);
 // 创建不同大小的字体并赋值给全局变量
 
 font_medium = lv_tiny_ttf_create_data(xiaozhi_font, xiaozhi_font_size, medium_font_size);
+home_time_font = lv_tiny_ttf_create_data(xiaozhi_font, xiaozhi_font_size, home_time_font_size);
+home_meta_font = lv_tiny_ttf_create_data(xiaozhi_font, xiaozhi_font_size, home_meta_font_size);
+home_label_font = lv_tiny_ttf_create_data(xiaozhi_font, xiaozhi_font_size, home_label_font_size);
+home_status_font = lv_tiny_ttf_create_data(xiaozhi_font, xiaozhi_font_size, home_status_font_size);
 
 
     g_scale = scale; // 保存全局缩放因子
@@ -1996,20 +1776,37 @@ font_medium = lv_tiny_ttf_create_data(xiaozhi_font, xiaozhi_font_size, medium_fo
     lv_obj_set_style_bg_color(lv_screen_active(), lv_color_hex(0x000000),
                               LV_PART_MAIN | LV_STATE_DEFAULT); // SET BG COLOR
 
+    rt_kprintf("xz_ui: before obj init\n");
 
     ret = xiaozhi_ui_obj_init();
     if (ret != RT_EOK)
     {
+        LOG_E("xiaozhi_ui_obj_init failed: %d", ret);
         return;
     }
+    rt_kprintf("xz_ui: obj init done\n");
     
     rt_charge_set_rx_ind(charger_event_callback); // 初始化充电检测
     set_charge_icon();
+    rt_kprintf("xz_ui: charge icon ready\n");
 
-    xiaozhi_ui_update_ble("close");
-    xiaozhi_ui_chat_status("连接中...");
-    xiaozhi_ui_chat_output("等待连接...");
-    xiaozhi_ui_update_emoji("neutral");
+    if (global_img_ble)
+    {
+        lv_img_set_src(global_img_ble, &ble_close);
+    }
+    if (global_label1)
+    {
+        lv_label_set_text(global_label1, "连接中...");
+    }
+    if (global_label2)
+    {
+        lv_label_set_text(global_label2, "等待连接...");
+    }
+    if (seqimg)
+    {
+        lv_seqimg_src_array(seqimg, neutral, sizeof(neutral) / sizeof(neutral[0]));
+    }
+    rt_kprintf("xz_ui: startup ui ready\n");
 
 
     //每秒更新时间的ui
@@ -2114,15 +1911,23 @@ font_medium = lv_tiny_ttf_create_data(xiaozhi_font, xiaozhi_font_size, medium_fo
         }
         
         // 处理UI消息队列中的消息
-        ui_msg_t* msg;
-        while (rt_mq_recv(ui_msg_queue, &msg, sizeof(ui_msg_t*), 0) == RT_EOK)
+        ui_msg_t msg;
+        while (rt_mq_recv(ui_msg_queue, &msg, sizeof(ui_msg_t), 0) == RT_EOK)
         {
-            switch (msg->type)
+            rt_kprintf("xz_ui: handling msg %d\n", msg.type);
+            switch (msg.type)
             {
                 case UI_MSG_STANDBY_CHAT_OUTPUT:
-                    if(msg->data)
+                    if(msg.payload.text[0] != '\0')
                     {
-                        lv_label_set_text(ui_Label3, msg->data);    
+                        if (ui_Label3)
+                        {
+                            lv_label_set_text(ui_Label3, msg.payload.text);
+                        }
+                        else
+                        {
+                            rt_kprintf("xz_ui: standby chat label missing, ignore: %s\n", msg.payload.text);
+                        }
                     }
                     break;
                 case UI_MSG_UPDATE_WEATHER_AND_TIME:
@@ -2130,16 +1935,16 @@ font_medium = lv_tiny_ttf_create_data(xiaozhi_font, xiaozhi_font_size, medium_fo
                     rt_mb_send(g_bt_app_mb, UPDATE_REAL_WEATHER_AND_TIME);
                     break;
                 case UI_MSG_STANDBY_EMOJI:
-                    if(msg->data)
+                    if(msg.payload.text[0] != '\0')
                     {
-                        if (strcmp(msg->data, "sleepy") == 0)
+                        if (strcmp(msg.payload.text, "sleepy") == 0)
                         {
                             if (img_emoji) 
                             {
                                 lv_img_set_src(img_emoji, &sleepy2); // 使用睡眠表情表示小智未连接
                             }
                         }
-                        else if (strcmp(msg->data, "funny") == 0)
+                        else if (strcmp(msg.payload.text, "funny") == 0)
                         {
                             if (img_emoji) 
                             {
@@ -2150,6 +1955,15 @@ font_medium = lv_tiny_ttf_create_data(xiaozhi_font, xiaozhi_font_size, medium_fo
                     break;
                 case UI_MSG_SWITCH_TO_STANDBY:
                     if (standby_screen) {
+                        lv_obj_t *active_screen = lv_screen_active();
+                        if (active_screen == standby_screen ||
+                            active_screen == sleep_screen ||
+                            active_screen == shutdown_screen ||
+                            active_screen == low_battery_shutdown_screen)
+                        {
+                            break;
+                        }
+
                         lv_screen_load(standby_screen);
                         lv_obj_set_parent(cont, lv_screen_active());
                         lv_obj_set_parent(update_confirm_popup, lv_screen_active());
@@ -2163,17 +1977,11 @@ font_medium = lv_tiny_ttf_create_data(xiaozhi_font, xiaozhi_font_size, medium_fo
                             kws_demo();
                         }    
 
-                        if(ui_sleep_timer != NULL)
-                        {
-                            lv_timer_delete(ui_sleep_timer);
-                            ui_sleep_timer = NULL;
-                        }
                         if(g_pan_connected)
                         {
                             rt_kprintf("create sleep timer1\n");
-                            ui_sleep_timer = lv_timer_create(ui_sleep_callback, 60000, NULL);
-
-                        } 
+                        }
+                        ui_restart_sleep_timer(60000);
 
                         if (standby_update_timer != NULL) {
                             lv_timer_delete(standby_update_timer);
@@ -2213,176 +2021,176 @@ font_medium = lv_tiny_ttf_create_data(xiaozhi_font, xiaozhi_font_size, medium_fo
                     time_ui_update_callback();
                     break;
                 case UI_MSG_CHAT_STATUS:
-                    if(msg->data)
+                    if(msg.payload.text[0] != '\0')
                     {
-                        lv_label_set_text(global_label1, msg->data);
+                        lv_label_set_text(global_label1, msg.payload.text);
                     }
                     break;
                 case UI_MSG_CHAT_OUTPUT:
-                    if(msg->data)
+                    if(msg.payload.text[0] != '\0')
                     {
-                        lv_label_set_text(global_label2, msg->data);    
+                        lv_label_set_text(global_label2, msg.payload.text);
                     }
                     break;
                 case UI_MSG_VOLUME_UPDATE:
-                    if(msg->data) {
-                        int volume = *((int*)msg->data);
-                        if (volume_slider) {
-                            lv_slider_set_value(volume_slider, volume, LV_ANIM_OFF);
-                        }
+                {
+                    int volume = msg.payload.int_value;
+                    if (volume_slider) {
+                        lv_slider_set_value(volume_slider, volume, LV_ANIM_OFF);
                     }
                     break; 
+                }
                 case UI_MSG_BRIGHTNESS_UPDATE:
-                    if(msg->data) {
-                        int brightness = *((int*)msg->data);
-                        // 更新亮度显示条
-                        if (brightness_lines) {
-                            uint32_t cnt = lv_obj_get_child_count(brightness_lines);
-                            lv_obj_t* child;
-                            uint16_t i = 0;
-                            // 根据亮度值更新显示条的颜色
-                            while(i < cnt) {
-                                child = lv_obj_get_child(brightness_lines, i);
-                                if (brigtness_tb[i] <= brightness)
-                                    lv_obj_set_style_bg_color(child, lv_palette_main(LV_PALETTE_LIGHT_GREEN), 0);
-                                else
-                                    lv_obj_set_style_bg_color(child, lv_palette_main(LV_PALETTE_GREY), 0);
-                                i++;
+                {
+                    int brightness = msg.payload.int_value;
+                    // 更新亮度显示条
+                    if (brightness_lines) {
+                        uint32_t cnt = lv_obj_get_child_count(brightness_lines);
+                        lv_obj_t* child;
+                        uint16_t i = 0;
+                        // 根据亮度值更新显示条的颜色
+                        while(i < cnt) {
+                            child = lv_obj_get_child(brightness_lines, i);
+                            if (brigtness_tb[i] <= brightness)
+                                lv_obj_set_style_bg_color(child, lv_palette_main(LV_PALETTE_LIGHT_GREEN), 0);
+                            else
+                                lv_obj_set_style_bg_color(child, lv_palette_main(LV_PALETTE_GREY), 0);
+                            i++;
+                        }
+                    }
+                    break;
+                }
+                case UI_MSG_CHARGE_STATUS_CHANGED:
+                {
+                    uint8_t is_charging = msg.payload.u8_value;
+                    bool should_show_charging = is_charging && (g_battery_level < 100);
+                    if (charging_icon) 
+                    {
+                        if (should_show_charging) 
+                        {
+                            lv_obj_clear_flag(charging_icon, LV_OBJ_FLAG_HIDDEN);
+                            rt_kprintf("显示充电图标\n");
+                        } 
+                        else 
+                        {
+                           if (is_charging && g_battery_level >= 100) 
+                            {
+                                rt_kprintf("电量已满，隐藏充电图标 (电量: %d%%)\n", g_battery_level);
+                                lv_obj_add_flag(charging_icon, LV_OBJ_FLAG_HIDDEN);
+                            } 
+                            else 
+                            {
+                                rt_kprintf("隐藏充电图标\n");
+                                lv_obj_add_flag(charging_icon, LV_OBJ_FLAG_HIDDEN);
+                            }
+                        }
+                    }
+                    if (standby_charging_icon) 
+                    {
+                        if (should_show_charging) 
+                        {
+                            lv_obj_clear_flag(standby_charging_icon, LV_OBJ_FLAG_HIDDEN);
+                            rt_kprintf("显示待机界面充电图标 (电量: %d%%)\n", g_battery_level);
+                        } 
+                        else 
+                        {
+                            lv_obj_add_flag(standby_charging_icon, LV_OBJ_FLAG_HIDDEN);
+                            if (is_charging && g_battery_level >= 100) 
+                            {
+                                rt_kprintf("电量已满，隐藏待机界面充电图标 (电量: %d%%)\n", g_battery_level);
+                            } 
+                            else 
+                            {
+                                rt_kprintf("隐藏待机界面充电图标\n");
                             }
                         }
                     }
                     break;
-                case UI_MSG_CHARGE_STATUS_CHANGED:
-                    if(msg->data) {
-                        uint8_t is_charging = *((uint8_t*)msg->data);
-                        bool should_show_charging = is_charging && (g_battery_level < 100);
-                        if (charging_icon) 
-                        {
-                            if (should_show_charging) 
-                            {
-                                lv_obj_clear_flag(charging_icon, LV_OBJ_FLAG_HIDDEN);
-                                rt_kprintf("显示充电图标\n");
-                            } 
-                            else 
-                            {
-                               if (is_charging && g_battery_level >= 100) 
-                                {
-                                    rt_kprintf("电量已满，隐藏充电图标 (电量: %d%%)\n", g_battery_level);
-                                    lv_obj_add_flag(charging_icon, LV_OBJ_FLAG_HIDDEN);
-                                } 
-                                else 
-                                {
-                                    rt_kprintf("隐藏充电图标\n");
-                                    lv_obj_add_flag(charging_icon, LV_OBJ_FLAG_HIDDEN);
-                                }
-                            }
-                        }
-                        if (standby_charging_icon) 
-                        {
-                            if (should_show_charging) 
-                            {
-                                lv_obj_clear_flag(standby_charging_icon, LV_OBJ_FLAG_HIDDEN);
-                                rt_kprintf("显示待机界面充电图标 (电量: %d%%)\n", g_battery_level);
-                            } 
-                            else 
-                            {
-                                lv_obj_add_flag(standby_charging_icon, LV_OBJ_FLAG_HIDDEN);
-                                if (is_charging && g_battery_level >= 100) 
-                                {
-                                    rt_kprintf("电量已满，隐藏待机界面充电图标 (电量: %d%%)\n", g_battery_level);
-                                } 
-                                else 
-                                {
-                                    rt_kprintf("隐藏待机界面充电图标\n");
-                                }
-                            }
-                        }
-                    }
-                break;      
+                }
                 case UI_MSG_UPDATE_EMOJI:
-                    if(msg->data)
+                    if(msg.payload.text[0] != '\0')
                     {
-                        if (strcmp(msg->data, "neutral") == 0)
+                        if (strcmp(msg.payload.text, "neutral") == 0)
                         {
                             lv_seqimg_src_array(seqimg, neutral, sizeof(neutral) / sizeof(neutral[0]));
                         }
-                        else if (strcmp(msg->data, "happy") == 0)
+                        else if (strcmp(msg.payload.text, "happy") == 0)
                         {
                             lv_seqimg_src_array(seqimg, funny, sizeof(funny) / sizeof(funny[0]));
                         }
-                        else if (strcmp(msg->data, "laughing") == 0)
+                        else if (strcmp(msg.payload.text, "laughing") == 0)
                         {
                             lv_seqimg_src_array(seqimg, funny, sizeof(funny) / sizeof(funny[0]));
                         }
-                        else if (strcmp(msg->data, "funny") == 0)
+                        else if (strcmp(msg.payload.text, "funny") == 0)
                         {
                             lv_seqimg_src_array(seqimg, funny, sizeof(funny) / sizeof(funny[0]));
                         }
-                        else if (strcmp(msg->data, "sad") == 0)
+                        else if (strcmp(msg.payload.text, "sad") == 0)
                         {
                             lv_seqimg_src_array(seqimg, crying, sizeof(crying) / sizeof(crying[0]));
                         }
-                        else if (strcmp(msg->data, "angry") == 0)
+                        else if (strcmp(msg.payload.text, "angry") == 0)
                         {
                             lv_seqimg_src_array(seqimg, angry, sizeof(angry) / sizeof(angry[0]));
                         }
-                        else if (strcmp(msg->data, "crying") == 0)
+                        else if (strcmp(msg.payload.text, "crying") == 0)
                         {
                             lv_seqimg_src_array(seqimg, crying, sizeof(crying) / sizeof(crying[0]));
                         }
-                        else if (strcmp(msg->data, "loving") == 0)
+                        else if (strcmp(msg.payload.text, "loving") == 0)
                         {
                             lv_seqimg_src_array(seqimg, loving, sizeof(loving) / sizeof(loving[0]));
                         }
-                        else if (strcmp(msg->data, "embarrassed") == 0)
+                        else if (strcmp(msg.payload.text, "embarrassed") == 0)
                         {
                             lv_seqimg_src_array(seqimg, embarrassed, sizeof(embarrassed) / sizeof(embarrassed[0]));
                         }
-                        else if (strcmp(msg->data, "surprised") == 0)
+                        else if (strcmp(msg.payload.text, "surprised") == 0)
                         {
                             lv_seqimg_src_array(seqimg, surprised, sizeof(surprised) / sizeof(surprised[0]));
                         }
-                        else if (strcmp(msg->data, "shocked") == 0)
+                        else if (strcmp(msg.payload.text, "shocked") == 0)
                         {
                             lv_seqimg_src_array(seqimg, surprised, sizeof(surprised) / sizeof(surprised[0]));
                         }
-                        else if (strcmp(msg->data, "thinking") == 0)
+                        else if (strcmp(msg.payload.text, "thinking") == 0)
                         {
                             lv_seqimg_src_array(seqimg, thinking, sizeof(thinking) / sizeof(thinking[0]));
                         }
-                        else if (strcmp(msg->data, "winking") == 0)
+                        else if (strcmp(msg.payload.text, "winking") == 0)
                         {
                             lv_seqimg_src_array(seqimg, loving, sizeof(loving) / sizeof(loving[0]));
                         }
-                        else if (strcmp(msg->data, "cool") == 0)
+                        else if (strcmp(msg.payload.text, "cool") == 0)
                         {
                             lv_seqimg_src_array(seqimg, cool, sizeof(cool) / sizeof(cool[0]));
                         }
-                        else if (strcmp(msg->data, "relaxed") == 0)
+                        else if (strcmp(msg.payload.text, "relaxed") == 0)
                         {
                             lv_seqimg_src_array(seqimg, cool, sizeof(cool) / sizeof(cool[0]));
                         }
-                        else if (strcmp(msg->data, "delicious") == 0)
+                        else if (strcmp(msg.payload.text, "delicious") == 0)
                         {
                             lv_seqimg_src_array(seqimg, loving, sizeof(loving) / sizeof(loving[0]));
                         }
-                        else if (strcmp(msg->data, "kissy") == 0)
+                        else if (strcmp(msg.payload.text, "kissy") == 0)
                         {
                             lv_seqimg_src_array(seqimg, kissy, sizeof(kissy) / sizeof(kissy[0]));
                         }
-                        else if (strcmp(msg->data, "confident") == 0)
+                        else if (strcmp(msg.payload.text, "confident") == 0)
                         {
                             lv_seqimg_src_array(seqimg, cool, sizeof(cool) / sizeof(cool[0]));
                         }
-                        else if (strcmp(msg->data, "sleepy") == 0)
+                        else if (strcmp(msg.payload.text, "sleepy") == 0)
                         {
                             lv_seqimg_src_array(seqimg, sleepy, sizeof(sleepy) / sizeof(sleepy[0]));
                         }
-                        else if (strcmp(msg->data, "silly") == 0)
+                        else if (strcmp(msg.payload.text, "silly") == 0)
                         {
                             lv_seqimg_src_array(seqimg, thinking, sizeof(thinking) / sizeof(thinking[0]));
                         }
-                        else if (strcmp(msg->data, "confused") == 0)
+                        else if (strcmp(msg.payload.text, "confused") == 0)
                         {
                             lv_seqimg_src_array(seqimg, thinking, sizeof(thinking) / sizeof(thinking[0]));
                         }
@@ -2393,22 +2201,22 @@ font_medium = lv_tiny_ttf_create_data(xiaozhi_font, xiaozhi_font_size, medium_fo
                     }
                     break;
                 case UI_MSG_UPDATE_BLE:
-                    if(msg->data)
+                    if(msg.payload.text[0] != '\0')
                     {
-                        if (strcmp(msg->data, "open") == 0)
+                        if (strcmp(msg.payload.text, "open") == 0)
                         {
                             lv_img_set_src(global_img_ble, &ble);
                         }
-                        else if (strcmp(msg->data, "close") == 0)
+                        else if (strcmp(msg.payload.text, "close") == 0)
                         {
                             lv_img_set_src(global_img_ble, &ble_close);
                         }
                     }
                     break;
                 case UI_MSG_TTS_OUTPUT:
-                    if(msg->data)
+                    if(msg.payload.text[0] != '\0')
                     {
-                         int len = strlen(msg->data);
+                         int len = strlen(msg.payload.text);
                         rt_kprintf("len == %d\n", len);
 
                         if (len > SHOW_TEXT_LEN) {
@@ -2417,7 +2225,7 @@ font_medium = lv_tiny_ttf_create_data(xiaozhi_font, xiaozhi_font_size, medium_fo
 
                             // 向前调整到完整的 UTF-8 字符起点
                             while (cut_pos > 0 &&
-                                   ((unsigned char)msg->data[cut_pos] & 0xC0) == 0x80) {
+                                   ((unsigned char)msg.payload.text[cut_pos] & 0xC0) == 0x80) {
                                 cut_pos--;
                             }
 
@@ -2426,11 +2234,11 @@ font_medium = lv_tiny_ttf_create_data(xiaozhi_font, xiaozhi_font_size, medium_fo
 
                             // 截取第一部分
                             char first_part[SHOW_TEXT_LEN + 1];
-                            strncpy(first_part, msg->data, cut_pos);
+                            strncpy(first_part, msg.payload.text, cut_pos);
                             first_part[cut_pos] = '\0'; // 确保字符串结束
 
                             // 剩余部分从 cut_pos 开始
-                            strncpy(g_second_part, msg->data + cut_pos, sizeof(g_second_part) - 1);
+                            strncpy(g_second_part, msg.payload.text + cut_pos, sizeof(g_second_part) - 1);
                             g_second_part[sizeof(g_second_part) - 1] = '\0'; // 确保结尾
                             g_label_for_second_part = global_label2;
 
@@ -2452,7 +2260,7 @@ font_medium = lv_tiny_ttf_create_data(xiaozhi_font, xiaozhi_font_size, medium_fo
                         } 
                         else 
                         {
-                            lv_label_set_text(global_label2, msg->data);
+                            lv_label_set_text(global_label2, msg.payload.text);
                         }
                     }
                     break;
@@ -2498,66 +2306,64 @@ font_medium = lv_tiny_ttf_create_data(xiaozhi_font, xiaozhi_font_size, medium_fo
                     }
                     break;
                 case UI_MSG_SHOW_UPDATE_CONFIRM:
-                    if (msg->data)
-                    {
-                        BOOL needs_update = *((BOOL *)msg->data);
-                            LOG_D("UI_MSG_SHOW_UPDATE_CONFIRM\n");
+                {
+                    BOOL needs_update = msg.payload.bool_value;
+                        LOG_D("UI_MSG_SHOW_UPDATE_CONFIRM\n");
 
-                            // 显示弹框
-                        if (update_confirm_popup)
-                        {
-                                
-                            lv_obj_remove_flag(update_confirm_popup,
-                                            LV_OBJ_FLAG_HIDDEN);
-                            }
-                            
-                            // 根据是否有更新设置弹框内容
-                        if (needs_update)
-                        {
-                                LOG_D("UI_MSG_SHOW_UPDATE_CONFIRM: needs_update\n");
-                                // 如果有新版本，显示更新提示和按钮
-                            if (update_confirm_label)
-                            {
-                                char update_text[32];
-                                snprintf(update_text, sizeof(update_text),
-                                        "发现新版本%s", latest_version);
-                                lv_label_set_text(update_confirm_label,
-                                                update_text);
-                                }
-                            if (update_button)
-                            {
-                                lv_obj_remove_flag(update_button,
-                                                LV_OBJ_FLAG_HIDDEN);
-                            }
+                        // 显示弹框
+                    if (update_confirm_popup)
+                    {
+                        lv_obj_remove_flag(update_confirm_popup,
+                                        LV_OBJ_FLAG_HIDDEN);
                         }
-                        else
+                        
+                        // 根据是否有更新设置弹框内容
+                    if (needs_update)
+                    {
+                            LOG_D("UI_MSG_SHOW_UPDATE_CONFIRM: needs_update\n");
+                            // 如果有新版本，显示更新提示和按钮
+                        if (update_confirm_label)
                         {
-                                LOG_D("UI_MSG_SHOW_UPDATE_CONFIRM: no update\n");    
-                                // 如果没有新版本，显示无需更新提示并隐藏更新按钮
-                            if (update_confirm_label)
-                            {
-                                lv_label_set_text(update_confirm_label,
-                                                "当前已是最新版本");
-                                }
-                            if (update_button)
-                            {
-                                lv_obj_add_flag(update_button,
-                                                LV_OBJ_FLAG_HIDDEN); // 隐藏更新按钮
+                            char update_text[32];
+                            snprintf(update_text, sizeof(update_text),
+                                    "发现新版本%s", latest_version);
+                            lv_label_set_text(update_confirm_label,
+                                            update_text);
                             }
+                        if (update_button)
+                        {
+                            lv_obj_remove_flag(update_button,
+                                            LV_OBJ_FLAG_HIDDEN);
+                        }
+                    }
+                    else
+                    {
+                            LOG_D("UI_MSG_SHOW_UPDATE_CONFIRM: no update\n");    
+                            // 如果没有新版本，显示无需更新提示并隐藏更新按钮
+                        if (update_confirm_label)
+                        {
+                            lv_label_set_text(update_confirm_label,
+                                            "当前已是最新版本");
+                            }
+                        if (update_button)
+                        {
+                            lv_obj_add_flag(update_button,
+                                            LV_OBJ_FLAG_HIDDEN); // 隐藏更新按钮
                         }
                     }
                     break;
+                }
                 case UI_MSG_UPDATE_LATEST_VERSION:
-                    if (msg->data && latest_version_label)
+                    if (msg.payload.text[0] != '\0' && latest_version_label)
                     {
-                        lv_label_set_text(latest_version_label, msg->data);
+                        lv_label_set_text(latest_version_label, msg.payload.text);
 
                         // 显示版本提示弹框
                         if (update_confirm_popup)
                         {
                             char update_text[32];
                             snprintf(update_text, sizeof(update_text),
-                                    "发现新版本%s", msg->data);
+                                    "发现新版本%s", msg.payload.text);
                             lv_label_set_text(update_confirm_label, update_text);
                             lv_obj_remove_flag(update_confirm_popup,
                                             LV_OBJ_FLAG_HIDDEN);
@@ -2568,9 +2374,18 @@ font_medium = lv_tiny_ttf_create_data(xiaozhi_font, xiaozhi_font_size, medium_fo
                     rt_kprintf("UI thread: reinitializing audio\n");
                     reinit_audio();
                     break;
+                case UI_MSG_TRIGGER_ACTIVITY:
+#ifdef BSP_USING_PM
+                    lv_display_trigger_activity(NULL);
+#endif
+                    break;
+                case UI_MSG_START_SLEEP_TIMER:
+                    ui_restart_sleep_timer((rt_uint32_t)msg.payload.int_value);
+                    break;
                 case UI_MSG_CONFIRM_BUTTON_EVENT: 
+                {
                     // 从消息数据中获取按钮类型
-                    BOOL is_update_button = *(BOOL *)msg->data;
+                    BOOL is_update_button = msg.payload.bool_value;
                     // 检查弹框是否已创建且可见
                     if (update_confirm_popup && !lv_obj_has_flag(update_confirm_popup, LV_OBJ_FLAG_HIDDEN))
                     {
@@ -2594,10 +2409,8 @@ font_medium = lv_tiny_ttf_create_data(xiaozhi_font, xiaozhi_font_size, medium_fo
                         }
                     }
                     break;
+                }
             }
-            // 释放消息内存
-            ui_free(msg->data);
-            rt_free(msg);
         }
         if (RT_EOK == rt_sem_trytake(&update_ui_sema))
         {

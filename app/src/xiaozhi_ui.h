@@ -29,6 +29,8 @@ void xiaozhi_ui_update_charge_status(uint8_t is_charging);
 void xiaozhi_ui_update_latest_version(char *version);
 void xiaozhi_ui_update_confirm_button_event(bool is_update_button);
 void xiaozhi_ui_reinit_audio(void);
+void xiaozhi_ui_trigger_activity(void);
+void xiaozhi_ui_start_sleep_timer(rt_uint32_t timeout_ms);
 float get_scale_factor(void);
 
 extern const lv_image_dsc_t * angry[57];

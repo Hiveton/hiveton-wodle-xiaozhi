@@ -20,8 +20,12 @@ cwd     = GetCurrentDir()
 CPPPATH = [cwd]
 libpath = [cwd + '/kws']
 CPPPATH += [cwd + '/kws']
+CPPPATH += [cwd + '/ui']
+CPPPATH += [cwd + '/ui/home']
 # Add source code
 src = Glob('*.c')
+src = src + Glob('./ui/*.c')
+src = src + Glob('./ui/home/*.c')
 src = src + Glob('./mcp/*.cc') 
 src = src + Glob('./iot/*.cc')  
 src = src + Glob('./kws/*.c')
@@ -35,4 +39,3 @@ group = DefineGroup('Applications', src, depend = [''], CPPDEFINES = CPPDEFINES,
     LIBPATH = libpath)
 
 Return('group')
-
