@@ -98,6 +98,8 @@ static struct rt_thread battery_thread;
 extern char latest_version[32];
 
 
+extern const lv_image_dsc_t t6;
+
 //ui线程
 #if defined(__CC_ARM) || defined(__CLANG_ARM)
 L2_RET_BSS_SECT_BEGIN(xiaozhi_ui_thread_stack) //6000地址
@@ -733,8 +735,47 @@ void check_low_power(void)
     }
 }
 
+static void show_test_png_and_block(void)
+{
+    rt_err_t ret = littlevgl2rtt_init("lcd");
+    if (ret != RT_EOK)
+    {
+        rt_kprintf("littlevgl2rtt_init failed: %d\n", ret);
+        while (1)
+        {
+            rt_thread_mdelay(1000);
+        }
+    }
+
+    lv_obj_t *screen = lv_obj_create(NULL);
+    lv_obj_set_size(screen, LV_PCT(100), LV_PCT(100));
+    lv_obj_set_style_bg_color(screen, lv_color_hex(0x000000), LV_PART_MAIN | LV_STATE_DEFAULT);
+    lv_obj_set_style_border_width(screen, 0, 0);
+
+    lv_obj_t *img = lv_img_create(screen);
+    lv_img_set_src(img, &t6);
+    rt_kprintf("screen=%dx%d, image=%dx%d\n",
+               lv_display_get_horizontal_resolution(NULL),
+               lv_display_get_vertical_resolution(NULL),
+               t6.header.w, t6.header.h);
+
+    /* test.png is prepared as panel-native resolution, keep strict 1:1 mapping. */
+    lv_img_set_zoom(img, 256);
+
+    lv_obj_center(img);
+    lv_screen_load(screen);
+
+    while (1)
+    {
+        lv_task_handler();
+        rt_thread_mdelay(5);
+    }
+}
+
 int main(void)
 {
+    show_test_png_and_block();
+
     check_poweron_reason();
     // 初始化邮箱
     g_button_event_mb = rt_mb_create("btn_evt", 8, RT_IPC_FLAG_FIFO);

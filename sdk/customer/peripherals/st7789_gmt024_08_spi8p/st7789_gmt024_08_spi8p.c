@@ -16,6 +16,8 @@
 #define EPD_GATE_PIXELS 528
 #define EPD_WIDTH EPD_SRC_PIXELS
 #define EPD_HEIGHT EPD_GATE_PIXELS
+#define EPD_LOGICAL_WIDTH LCD_HOR_RES_MAX
+#define EPD_LOGICAL_HEIGHT LCD_VER_RES_MAX
 #define EPD_GRAY2_FRAME_SIZE (EPD_WIDTH * EPD_HEIGHT / 4) /* 2bpp */
 #define EPD_MONO_FRAME_SIZE (EPD_WIDTH * EPD_HEIGHT / 8)  /* 1bpp */
 #define EPD_SELF_TEST_PATTERN 0
@@ -207,6 +209,14 @@ static inline uint8_t epd_get_gray2_pixel(uint16_t x, uint16_t y)
     return (uint8_t)((mixed_framebuffer[byte_idx] >> shift) & 0x3u);
 }
 
+static inline void epd_map_logical_to_physical(uint16_t lx, uint16_t ly,
+                                               uint16_t *px, uint16_t *py)
+{
+    /* Logical (portrait): 528x792 -> Physical (landscape): 792x528 */
+    *px = ly;
+    *py = (uint16_t)(EPD_HEIGHT - 1U - lx);
+}
+
 static void EPD_Gray2ToMonoDither(void)
 {
     static const uint8_t bayer2x2[2][2] = {
@@ -266,8 +276,8 @@ static void EPD_FrameBuffer_UpdateRegion(const uint8_t *data, uint16_t x0, uint1
     }
     
     // 边界检查
-    if (x1 >= EPD_WIDTH) x1 = EPD_WIDTH - 1;
-    if (y1 >= EPD_HEIGHT) y1 = EPD_HEIGHT - 1;
+    if (x1 >= EPD_LOGICAL_WIDTH) x1 = EPD_LOGICAL_WIDTH - 1;
+    if (y1 >= EPD_LOGICAL_HEIGHT) y1 = EPD_LOGICAL_HEIGHT - 1;
     
     if (!framebuffer_initialized)
     {
@@ -291,7 +301,9 @@ static void EPD_FrameBuffer_UpdateRegion(const uint8_t *data, uint16_t x0, uint1
             uint8_t b = pixel & 0x03;         // 2 bits
             uint16_t gray = (uint16_t)r * 36 + (uint16_t)g * 36 + (uint16_t)b * 64;  // 0-252
             uint8_t gray2 = (gray < 64) ? 0 : (gray < 128) ? 1 : (gray < 192) ? 2 : 3;
-            epd_set_gray2_pixel(x, y, gray2);
+            uint16_t px, py;
+            epd_map_logical_to_physical(x, y, &px, &py);
+            epd_set_gray2_pixel(px, py, gray2);
         }
     }
 }
@@ -304,8 +316,8 @@ static void EPD_FrameBuffer_UpdateRegionRGB565(const uint8_t *data, uint16_t x0,
         return;
     }
 
-    if (x1 >= EPD_WIDTH) x1 = EPD_WIDTH - 1;
-    if (y1 >= EPD_HEIGHT) y1 = EPD_HEIGHT - 1;
+    if (x1 >= EPD_LOGICAL_WIDTH) x1 = EPD_LOGICAL_WIDTH - 1;
+    if (y1 >= EPD_LOGICAL_HEIGHT) y1 = EPD_LOGICAL_HEIGHT - 1;
 
     if (!framebuffer_initialized)
     {
@@ -330,7 +342,9 @@ static void EPD_FrameBuffer_UpdateRegionRGB565(const uint8_t *data, uint16_t x0,
 
             uint16_t gray = (uint16_t)(r8 * 30 + g8 * 59 + b8 * 11) / 100;
             uint8_t gray2 = (gray < 64) ? 0 : (gray < 128) ? 1 : (gray < 192) ? 2 : 3;
-            epd_set_gray2_pixel(x, y, gray2);
+            uint16_t px, py;
+            epd_map_logical_to_physical(x, y, &px, &py);
+            epd_set_gray2_pixel(px, py, gray2);
         }
     }
 }
@@ -352,8 +366,8 @@ static void EPD_FrameBuffer_UpdateRegion1bpp(const uint8_t *data, uint16_t x0, u
     }
     
     // 边界检查
-    if (x1 >= EPD_WIDTH) x1 = EPD_WIDTH - 1;
-    if (y1 >= EPD_HEIGHT) y1 = EPD_HEIGHT - 1;
+    if (x1 >= EPD_LOGICAL_WIDTH) x1 = EPD_LOGICAL_WIDTH - 1;
+    if (y1 >= EPD_LOGICAL_HEIGHT) y1 = EPD_LOGICAL_HEIGHT - 1;
     
     if (!framebuffer_initialized)
     {
@@ -373,7 +387,9 @@ static void EPD_FrameBuffer_UpdateRegion1bpp(const uint8_t *data, uint16_t x0, u
             uint32_t src_byte_idx = src_offset + ((x - x0) / 8);
             uint8_t src_bit = (uint8_t)(7 - ((x - x0) % 8));
             uint8_t mono = (uint8_t)((data[src_byte_idx] >> src_bit) & 0x1u);
-            epd_set_gray2_pixel(x, y, mono ? 3 : 0);
+            uint16_t px, py;
+            epd_map_logical_to_physical(x, y, &px, &py);
+            epd_set_gray2_pixel(px, py, mono ? 3 : 0);
         }
     }
 }
@@ -744,15 +760,15 @@ static void LCD_DisplayOff(LCDC_HandleTypeDef *hlcdc)
 static void LCD_SetRegion(LCDC_HandleTypeDef *hlcdc, uint16_t Xpos0,
                           uint16_t Ypos0, uint16_t Xpos1, uint16_t Ypos1)
 {
-    if (Xpos1 >= EPD_WIDTH) Xpos1 = EPD_WIDTH - 1;
-    if (Ypos1 >= EPD_HEIGHT) Ypos1 = EPD_HEIGHT - 1;
+    if (Xpos1 >= EPD_LOGICAL_WIDTH) Xpos1 = EPD_LOGICAL_WIDTH - 1;
+    if (Ypos1 >= EPD_LOGICAL_HEIGHT) Ypos1 = EPD_LOGICAL_HEIGHT - 1;
     HAL_LCDC_SetROIArea(hlcdc, Xpos0, Ypos0, Xpos1, Ypos1);
 }
 
 static void LCD_WritePixel(LCDC_HandleTypeDef *hlcdc, uint16_t Xpos,
                            uint16_t Ypos, const uint8_t *RGBCode)
 {
-    if (RGBCode == NULL || Xpos >= EPD_WIDTH || Ypos >= EPD_HEIGHT)
+    if (RGBCode == NULL || Xpos >= EPD_LOGICAL_WIDTH || Ypos >= EPD_LOGICAL_HEIGHT)
     {
         return;
     }
@@ -805,7 +821,7 @@ static void LCD_WriteMultiplePixels(LCDC_HandleTypeDef *hlcdc,
     }
     
     /* 该屏只支持全局刷新：只在收到“最后一片”时触发一次全刷。 */
-    if (Ypos1 >= (EPD_HEIGHT - 1))
+    if (Ypos1 >= (EPD_LOGICAL_HEIGHT - 1))
     {
         rt_tick_t min_interval = rt_tick_from_millisecond(300);
         rt_tick_t now = rt_tick_get();
