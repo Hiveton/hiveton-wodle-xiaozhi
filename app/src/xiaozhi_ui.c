@@ -1737,13 +1737,13 @@ void xiaozhi_ui_task(void *args)
         return; // 低电量模式下不执行后续的正常初始化
     }
 float scale = get_scale_factor();
-float home_scale = (float)lv_disp_get_hor_res(NULL) / 528.0f;
+float home_scale = (float)lv_disp_get_hor_res(NULL) / 390.0f;
 
 const int medium_font_size = (int)(25 * scale + 0.5f);    // 秒显示
-const int home_time_font_size = (int)(34 * home_scale + 0.5f);
-const int home_meta_font_size = (int)(18 * home_scale + 0.5f);
-const int home_label_font_size = (int)(24 * home_scale + 0.5f);
-const int home_status_font_size = (int)(14 * home_scale + 0.5f);
+const int home_time_font_size = (int)(31 * home_scale + 0.5f);
+const int home_meta_font_size = (int)(13 * home_scale + 0.5f);
+const int home_label_font_size = (int)(17 * home_scale + 0.5f);
+const int home_status_font_size = (int)(13 * home_scale + 0.5f);
 // 创建不同大小的字体并赋值给全局变量
 
 font_medium = lv_tiny_ttf_create_data(xiaozhi_font, xiaozhi_font_size, medium_font_size);

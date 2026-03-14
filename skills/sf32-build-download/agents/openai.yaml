@@ -1,0 +1,4 @@
+interface:
+  display_name: "SF32 Build Download"
+  short_description: "Run the post-change SF32 LCD N16R8 compile and UART download loop."
+  default_prompt: "After code changes, build the sf32lb52-lcd_n16r8 target and download it with uart_download.sh."
