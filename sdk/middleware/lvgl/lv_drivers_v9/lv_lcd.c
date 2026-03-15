@@ -514,4 +514,3 @@ bool lv_refreshing_done(void)
 
     return true;
 }
-

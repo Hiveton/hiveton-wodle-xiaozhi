@@ -11,11 +11,14 @@ extern "C" {
 
 typedef enum
 {
-    XIAOZHI_HOME_TILE_AI = 0,
-    XIAOZHI_HOME_TILE_MUSIC,
-    XIAOZHI_HOME_TILE_READING,
-    XIAOZHI_HOME_TILE_RECORD,
+    XIAOZHI_HOME_TILE_READING = 0,
+    XIAOZHI_HOME_TILE_PET,
+    XIAOZHI_HOME_TILE_AI,
+    XIAOZHI_HOME_TILE_CLOCK,
+    XIAOZHI_HOME_TILE_WEATHER,
     XIAOZHI_HOME_TILE_CALENDAR,
+    XIAOZHI_HOME_TILE_RECORD,
+    XIAOZHI_HOME_TILE_MUSIC,
     XIAOZHI_HOME_TILE_SETTINGS,
 } xiaozhi_home_tile_t;
 
@@ -56,6 +59,7 @@ typedef struct
     lv_obj_t *last_time;
     lv_obj_t *ui_Image_calendar;
     lv_obj_t *ui_Label_year;
+    lv_obj_t *ui_Label_lunar;
     lv_obj_t *ui_Label_day;
     lv_obj_t *ui_Label_second;
     lv_obj_t *ui_Image_second;

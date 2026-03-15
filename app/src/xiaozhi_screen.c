@@ -72,6 +72,7 @@ extern const unsigned char xiaozhi_font[];
 extern const int xiaozhi_font_size;
 extern const lv_image_dsc_t cdian2; 
 extern const lv_image_dsc_t startup_logo;  //开机动画图标
+extern lv_obj_t *home_screen;
 extern lv_obj_t *standby_screen;
 extern lv_obj_t *cont;
 extern lv_obj_t *update_confirm_popup;
@@ -211,6 +212,10 @@ static void low_battery_shutdown_countdown_cb(lv_timer_t *timer)
         if(g_screen_before_low_battery == standby_screen)
         {
             ui_swith_to_standby_screen();
+        }
+        else if (g_screen_before_low_battery == home_screen)
+        {
+            ui_switch_to_home_screen();
         }
         else
         {
@@ -463,22 +468,14 @@ static void startup_fadeout_ready_cb(struct _lv_anim_t* anim)
     g_startup_animation_active = 0;
     rt_kprintf("Startup animation completed\n");
 
-    // 开机动画完成后显示待机画面
+    // 开机动画完成后先进入待机页，便于单独检查待机界面
     lv_obj_t *now_screen = lv_screen_active();
-    if (standby_screen && now_screen != low_battery_shutdown_screen && 
+    if (standby_screen && now_screen != low_battery_shutdown_screen &&
         now_screen != low_battery_warning_screen && now_screen != shutdown_screen && 
         now_screen != sleep_screen)
     {
         rt_kprintf("开机->待机");
-        lv_screen_load(standby_screen);
-        if (cont) {
-            lv_obj_set_parent(cont, lv_screen_active());
-            lv_obj_move_foreground(cont);
-        }
-        if (update_confirm_popup) {
-            lv_obj_set_parent(update_confirm_popup, lv_screen_active());
-        }
-        
+        ui_swith_to_standby_screen();
     }
 }
 

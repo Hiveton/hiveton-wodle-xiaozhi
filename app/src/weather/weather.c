@@ -18,6 +18,7 @@
 #include "littlevgl2rtt.h"
 #include <stdlib.h>
 #include <stdio.h>
+#include <string.h>
 #include "lv_image_dsc.h"
 
 static volatile int g_weather_sync_in_progress = 0;  // 天气同步进行标志
@@ -85,11 +86,39 @@ weather_info_t g_current_weather = {0};
 // 周几的字符串数组
 static const char *weekday_names[] = {"周日", "周一", "周二", "周三",
                                       "周四", "周五", "周六"};
+static const char *full_weekday_names[] = {"星期日", "星期一", "星期二", "星期三",
+                                           "星期四", "星期五", "星期六"};
 
 // 新增：月份的中文字符串数组
 static const char *month_names[] = {"",     "一月",   "二月",  "三月", "四月",
                                     "五月", "六月",   "七月",  "八月", "九月",
                                     "十月", "十一月", "十二月"};
+static const uint32_t lunar_info[] = {
+    0x04bd8, 0x04ae0, 0x0a570, 0x054d5, 0x0d260, 0x0d950, 0x16554, 0x056a0, 0x09ad0, 0x055d2,
+    0x04ae0, 0x0a5b6, 0x0a4d0, 0x0d250, 0x1d255, 0x0b540, 0x0d6a0, 0x0ada2, 0x095b0, 0x14977,
+    0x04970, 0x0a4b0, 0x0b4b5, 0x06a50, 0x06d40, 0x1ab54, 0x02b60, 0x09570, 0x052f2, 0x04970,
+    0x06566, 0x0d4a0, 0x0ea50, 0x06e95, 0x05ad0, 0x02b60, 0x186e3, 0x092e0, 0x1c8d7, 0x0c950,
+    0x0d4a0, 0x1d8a6, 0x0b550, 0x056a0, 0x1a5b4, 0x025d0, 0x092d0, 0x0d2b2, 0x0a950, 0x0b557,
+    0x06ca0, 0x0b550, 0x15355, 0x04da0, 0x0a5d0, 0x14573, 0x052d0, 0x0a9a8, 0x0e950, 0x06aa0,
+    0x0aea6, 0x0ab50, 0x04b60, 0x0aae4, 0x0a570, 0x05260, 0x0f263, 0x0d950, 0x05b57, 0x056a0,
+    0x096d0, 0x04dd5, 0x04ad0, 0x0a4d0, 0x0d4d4, 0x0d250, 0x0d558, 0x0b540, 0x0b5a0, 0x195a6,
+    0x095b0, 0x049b0, 0x0a974, 0x0a4b0, 0x0b27a, 0x06a50, 0x06d40, 0x0af46, 0x0ab60, 0x09570,
+    0x04af5, 0x04970, 0x064b0, 0x074a3, 0x0ea50, 0x06b58, 0x05ac0, 0x0ab60, 0x096d5, 0x092e0,
+    0x0c960, 0x0d954, 0x0d4a0, 0x0da50, 0x07552, 0x056a0, 0x0abb7, 0x025d0, 0x092d0, 0x0cab5,
+    0x0a950, 0x0b4a0, 0x0baa4, 0x0ad50, 0x055d9, 0x04ba0, 0x0a5b0, 0x15176, 0x052b0, 0x0a930,
+    0x07954, 0x06aa0, 0x0ad50, 0x05b52, 0x04b60, 0x0a6e6, 0x0a4e0, 0x0d260, 0x0ea65, 0x0d530,
+    0x05aa0, 0x076a3, 0x096d0, 0x04bd7, 0x04ad0, 0x0a4d0, 0x1d0b6, 0x0d250, 0x0d520, 0x0dd45,
+    0x0b5a0, 0x056d0, 0x055b2, 0x049b0, 0x0a577, 0x0a4b0, 0x0aa50, 0x1b255, 0x06d20, 0x0ada0,
+    0x14b63
+};
+static const char *lunar_month_names[] = {"正月", "二月", "三月", "四月", "五月", "六月",
+                                          "七月", "八月", "九月", "十月", "十一月", "十二月"};
+static const char *lunar_day_names[] = {
+    "初一", "初二", "初三", "初四", "初五", "初六", "初七", "初八", "初九", "初十",
+    "十一", "十二", "十三", "十四", "十五", "十六", "十七", "十八", "十九", "二十",
+    "廿一", "廿二", "廿三", "廿四", "廿五", "廿六", "廿七", "廿八", "廿九", "三十"};
+static const char *heavenly_stems[] = {"甲", "乙", "丙", "丁", "戊", "己", "庚", "辛", "壬", "癸"};
+static const char *earthly_branches[] = {"子", "丑", "寅", "卯", "辰", "巳", "午", "未", "申", "酉", "戌", "亥"};
 // 添加NTP服务器列表
 static const char *ntp_servers[] = {"ntp.aliyun.com", "time.windows.com",
                                     "pool.ntp.org", "cn.pool.ntp.org"};
@@ -109,6 +138,178 @@ const char *xiaozhi_time_get_weekday_str(int weekday)
         return weekday_names[weekday];
     }
     return "未知";
+}
+
+static const char *xiaozhi_time_get_full_weekday_str(int weekday)
+{
+    if (weekday >= 0 && weekday <= 6)
+    {
+        return full_weekday_names[weekday];
+    }
+    return "星期一";
+}
+
+static int is_gregorian_leap_year(int year)
+{
+    return ((year % 4 == 0) && (year % 100 != 0)) || (year % 400 == 0);
+}
+
+static int gregorian_days_in_month(int year, int month)
+{
+    static const int days_per_month[] = {31, 28, 31, 30, 31, 30, 31, 31, 30, 31, 30, 31};
+
+    if (month == 2 && is_gregorian_leap_year(year))
+    {
+        return 29;
+    }
+
+    return days_per_month[month - 1];
+}
+
+static int gregorian_days_since_1900(int year, int month, int day)
+{
+    int days = 0;
+    int y;
+    int m;
+
+    for (y = 1900; y < year; ++y)
+    {
+        days += is_gregorian_leap_year(y) ? 366 : 365;
+    }
+
+    for (m = 1; m < month; ++m)
+    {
+        days += gregorian_days_in_month(year, m);
+    }
+
+    return days + day - 1;
+}
+
+static int lunar_leap_month(int year)
+{
+    return lunar_info[year - 1900] & 0x0f;
+}
+
+static int lunar_leap_days(int year)
+{
+    if (lunar_leap_month(year))
+    {
+        return (lunar_info[year - 1900] & 0x10000) ? 30 : 29;
+    }
+
+    return 0;
+}
+
+static int lunar_month_days(int year, int month)
+{
+    return (lunar_info[year - 1900] & (0x10000 >> month)) ? 30 : 29;
+}
+
+static int lunar_year_days(int year)
+{
+    int sum = 348;
+    uint32_t info = lunar_info[year - 1900];
+    uint32_t bit;
+
+    for (bit = 0x8000; bit > 0x8; bit >>= 1)
+    {
+        if (info & bit)
+        {
+            ++sum;
+        }
+    }
+
+    return sum + lunar_leap_days(year);
+}
+
+static int format_lunar_text(int solar_year,
+                             int solar_month,
+                             int solar_day,
+                             char *buffer,
+                             size_t buffer_size)
+{
+    int offset;
+    int lunar_year = 1900;
+    int lunar_month = 1;
+    int lunar_day = 1;
+    int leap_month;
+    int is_leap = 0;
+
+    if (!buffer || buffer_size == 0)
+    {
+        return -RT_EINVAL;
+    }
+
+    if (solar_year < 1900 || solar_year >= 1900 + (int)(sizeof(lunar_info) / sizeof(lunar_info[0])))
+    {
+        rt_snprintf(buffer, buffer_size, "--");
+        return -RT_ERROR;
+    }
+
+    offset = gregorian_days_since_1900(solar_year, solar_month, solar_day) -
+             gregorian_days_since_1900(1900, 1, 31);
+    if (offset < 0)
+    {
+        rt_snprintf(buffer, buffer_size, "--");
+        return -RT_ERROR;
+    }
+
+    while (lunar_year < 1900 + (int)(sizeof(lunar_info) / sizeof(lunar_info[0])))
+    {
+        int year_days = lunar_year_days(lunar_year);
+        if (offset < year_days)
+        {
+            break;
+        }
+        offset -= year_days;
+        ++lunar_year;
+    }
+
+    leap_month = lunar_leap_month(lunar_year);
+    while (lunar_month <= 12)
+    {
+        int month_days;
+
+        if (leap_month > 0 && lunar_month == leap_month + 1 && !is_leap)
+        {
+            --lunar_month;
+            is_leap = 1;
+            month_days = lunar_leap_days(lunar_year);
+        }
+        else
+        {
+            month_days = lunar_month_days(lunar_year, lunar_month);
+        }
+
+        if (offset < month_days)
+        {
+            break;
+        }
+
+        offset -= month_days;
+
+        if (is_leap && lunar_month == leap_month)
+        {
+            is_leap = 0;
+        }
+
+        ++lunar_month;
+    }
+
+    lunar_day = offset + 1;
+    rt_snprintf(buffer,
+                buffer_size,
+                "%s%s年 %s%s",
+                heavenly_stems[(lunar_year - 4) % 10],
+                earthly_branches[(lunar_year - 4) % 12],
+                is_leap ? "闰" : "",
+                lunar_month_names[lunar_month - 1]);
+    rt_snprintf(buffer + rt_strlen(buffer),
+                buffer_size - rt_strlen(buffer),
+                "%s",
+                lunar_day_names[lunar_day - 1]);
+
+    return RT_EOK;
 }
 
 /**
@@ -503,12 +704,19 @@ void time_ui_update_callback(void)
     static int last_day = -1;
     static int last_bt_connected = -1;
     static int last_pan_connected = -1;
+    static int last_weekday = -1;
 
     static int last_hour_tens = -1;
     static int last_hour_units = -1;
     static int last_minute_tens = -1;
     static int last_minute_units = -1;
+    static int last_home_hour = -1;
+    static int last_home_minute = -1;
+    static int last_standby_hour = -1;
+    static int last_standby_minute = -1;
+    static int last_standby_second = -1;
     static int last_second = -1;//秒
+    char lunar_text[32];
 
     // 获取最新时间
     if (xiaozhi_time_get_current(&g_current_time) != RT_EOK)
@@ -523,6 +731,7 @@ void time_ui_update_callback(void)
     extern lv_obj_t *minute_units_img;
     extern lv_obj_t *ui_Label_second;
     extern lv_obj_t *home_time_label;
+    extern lv_obj_t *standby_time_label;
     // 根据小时和分钟更新数字图片
     // 更新小时显示
     int hour_tens = g_current_time.hour / 10;
@@ -563,45 +772,90 @@ void time_ui_update_callback(void)
         last_minute_units = minute_units;
     }
 
-    if (home_time_label) {
+    if (home_time_label &&
+        (g_current_time.hour != last_home_hour ||
+         g_current_time.minute != last_home_minute)) {
         char time_text[8];
         snprintf(time_text, sizeof(time_text), "%02d:%02d",
                  g_current_time.hour, g_current_time.minute);
         lv_label_set_text(home_time_label, time_text);
+        last_home_hour = g_current_time.hour;
+        last_home_minute = g_current_time.minute;
+    }
+
+    if (standby_time_label &&
+        (g_current_time.hour != last_standby_hour ||
+         g_current_time.minute != last_standby_minute)) {
+        char standby_time_text[8];
+        snprintf(standby_time_text, sizeof(standby_time_text), "%02d:%02d",
+                 g_current_time.hour, g_current_time.minute);
+        lv_label_set_text(standby_time_label, standby_time_text);
+        lv_obj_invalidate(standby_time_label);
+        rt_kprintf("[standby_dbg] label set to %s label=%p parent=%p active=%p\n",
+                   standby_time_text,
+                   standby_time_label,
+                   lv_obj_get_parent(standby_time_label),
+                   lv_screen_active());
+        last_standby_hour = g_current_time.hour;
+        last_standby_minute = g_current_time.minute;
     }
 
 
 
     // 更新待机界面秒
+    extern lv_obj_t *ui_Label_lunar;
     extern lv_obj_t *ui_Label_day;
     extern lv_obj_t *ui_Label_year;
      if (g_current_time.second != last_second) {
-        if (ui_Label_second) {
+        if (ui_Label_second &&
+            !lv_obj_has_flag(ui_Label_second, LV_OBJ_FLAG_HIDDEN)) {
             char second_text[8];
             snprintf(second_text, sizeof(second_text), "%02d", g_current_time.second);
             lv_label_set_text(ui_Label_second, second_text);
+            lv_obj_invalidate(ui_Label_second);
         }
+        last_standby_second = g_current_time.second;
         last_second = g_current_time.second;
     }
 
   // 更新年份显示
-    if (g_current_time.year != last_year) {
+    if (g_current_time.year != last_year ||
+        g_current_time.month != last_month ||
+        g_current_time.day != last_day) {
         if (ui_Label_year) {
-            char year_text[8];
-            snprintf(year_text, sizeof(year_text), "%d", g_current_time.year);
+            char year_text[16];
+            snprintf(year_text, sizeof(year_text), "%04d/%02d/%02d",
+                     g_current_time.year, g_current_time.month, g_current_time.day);
             lv_label_set_text(ui_Label_year, year_text);
         }
-        last_year = g_current_time.year;
-    }
-    // 更新月日显示
-    if (g_current_time.month != last_month || g_current_time.day != last_day) {
-        if (ui_Label_day) {
-            char date_text[8];
-            snprintf(date_text, sizeof(date_text), "%02d%02d", g_current_time.month, g_current_time.day);
-            lv_label_set_text(ui_Label_day, date_text);
+
+        if (ui_Label_lunar) {
+            if (format_lunar_text(g_current_time.year,
+                                  g_current_time.month,
+                                  g_current_time.day,
+                                  lunar_text,
+                                  sizeof(lunar_text)) == RT_EOK) {
+                lv_label_set_text(ui_Label_lunar, lunar_text);
+            } else {
+                lv_label_set_text(ui_Label_lunar, "--");
+            }
         }
+
+        if (ui_Label_day) {
+            lv_label_set_text(ui_Label_day,
+                              xiaozhi_time_get_full_weekday_str(g_current_time.weekday));
+        }
+
+        last_year = g_current_time.year;
         last_month = g_current_time.month;
         last_day = g_current_time.day;
+        last_weekday = g_current_time.weekday;
+    } else if (g_current_time.weekday != last_weekday) {
+        if (ui_Label_day) {
+            lv_label_set_text(ui_Label_day,
+                              xiaozhi_time_get_full_weekday_str(g_current_time.weekday));
+        }
+        last_weekday = g_current_time.weekday;
     }
 
    // 更新蓝牙和网络图标（仅在状态变化时更新）
@@ -652,11 +906,15 @@ void weather_ui_update_callback(void)
     
     // 更新温度显示 (使用新UI中的ui_Label_ip对象)
     if (ui_Label_ip) {
-        LOG_W("location%d\n",g_current_weather.location);
         char temp_text[32];
-        // 根据天气结构体中的城市和温度信息显示
-        snprintf(temp_text, sizeof(temp_text), "%.10s.%d°C", 
-                 g_current_weather.location, g_current_weather.temperature);
+        const char *weather_text = g_current_weather.text[0] ? g_current_weather.text : "--";
+
+        if (g_current_weather.last_update > 0 || g_current_weather.text[0]) {
+            snprintf(temp_text, sizeof(temp_text), "%d°C %s",
+                     g_current_weather.temperature, weather_text);
+        } else {
+            snprintf(temp_text, sizeof(temp_text), "--°C --");
+        }
         lv_label_set_text(ui_Label_ip, temp_text);
     }
     
@@ -832,8 +1090,8 @@ void weather_ui_update_callback(void)
     if (last_time && g_current_weather.last_update > 0) {
         struct tm *last_update_tm = localtime(&g_current_weather.last_update);
         if (last_update_tm) {
-            char last_update_text[16];
-            snprintf(last_update_text, sizeof(last_update_text), "%02d:%02d", 
+            char last_update_text[20];
+            snprintf(last_update_text, sizeof(last_update_text), "更新 %02d:%02d",
                      last_update_tm->tm_hour, last_update_tm->tm_min);
             lv_label_set_text(last_time, last_update_text);
             LOG_I("last_update_text:%s",last_update_text);

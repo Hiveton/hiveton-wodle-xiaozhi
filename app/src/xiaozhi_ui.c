@@ -1,3 +1,4 @@
+#include <stdint.h>
 #include "rtthread.h"
 #include "bf0_hal.h"
 #include "drv_io.h"
@@ -27,6 +28,7 @@
 #include "../board/board_hardware.h"
 #include "xiaozhi_screen.h"
 #include "ui/home/home_screen.h"
+#include "ui/home/standby_screen.h"
 #include "charge.h"
 #include "bt_pan_ota.h"
 
@@ -70,6 +72,7 @@ typedef enum {
     UI_MSG_WEATHER_UPDATE,
     UI_MSG_STANDBY_EMOJI,
     UI_MSG_SWITCH_TO_STANDBY,
+    UI_MSG_SWITCH_TO_HOME,
     UI_MSG_SWITCH_TO_MAIN,
     UI_MSG_UPDATE_WEATHER_AND_TIME,
     UI_MSG_STANDBY_CHAT_OUTPUT,
@@ -113,6 +116,8 @@ static lv_obj_t* charging_icon = NULL;
 static lv_obj_t* standby_charging_icon = NULL;
 static volatile uint8_t g_charge_status_isr_pending = 0;
 static volatile uint8_t g_charge_status_isr_value = 0;
+static xiaozhi_home_screen_refs_t g_home_screen_refs;
+static xiaozhi_home_screen_refs_t g_standby_screen_refs;
 
 
 lv_obj_t *cont = NULL;
@@ -196,6 +201,10 @@ static lv_font_t *home_time_font = NULL;
 static lv_font_t *home_meta_font = NULL;
 static lv_font_t *home_label_font = NULL;
 static lv_font_t *home_status_font = NULL;
+static lv_font_t *standby_clock_font = NULL;
+static lv_font_t *standby_date_font = NULL;
+static lv_font_t *standby_info_font = NULL;
+static lv_font_t *standby_weather_font = NULL;
 
 
 /*待机画面*/
@@ -236,12 +245,15 @@ lv_obj_t *network_icon = NULL;//网络图标
 lv_obj_t *weather_bgimg;//天气背景图片
 lv_obj_t *weather_icon;//天气图标
 lv_obj_t *ui_Image_calendar;//日历图标
+lv_obj_t *home_screen = NULL;//首页
 lv_obj_t *standby_screen = NULL;//待机界面
 lv_obj_t *home_time_label = NULL;//首页顶部时间
+lv_obj_t *standby_time_label = NULL;//待机页面大时间
 lv_obj_t *home_meta_label = NULL;//首页顶部日期天气
 lv_obj_t *ui_Label_ip = NULL;//地址和温度标签
 lv_obj_t *last_time = NULL;//上次更新天气图标
 lv_obj_t *ui_Label_year =NULL;//年份
+lv_obj_t *ui_Label_lunar = NULL;//农历
 lv_obj_t *ui_Label_day = NULL;//日期
 lv_obj_t *ui_Label_second =NULL;//秒
 lv_obj_t *ui_Image_second = NULL;//秒的图片
@@ -261,6 +273,87 @@ xz_audio_t *thiz = &xz_audio;
 static int g_battery_level = 60;        // 默认为满电
 static lv_obj_t *g_battery_fill = NULL;  // 电池填充对象
 static lv_obj_t *g_battery_label = NULL; // 电量标签
+static void set_charge_icon(void);
+static void ui_restart_sleep_timer(rt_uint32_t timeout_ms);
+
+static void apply_home_screen_status_refs(void)
+{
+    battery_percent_label = g_home_screen_refs.battery_percent_label;
+    bluetooth_icon = g_home_screen_refs.bluetooth_icon;
+    network_icon = g_home_screen_refs.network_icon;
+    standby_charging_icon = g_home_screen_refs.standby_charging_icon;
+    weather_icon = g_home_screen_refs.weather_icon;
+}
+
+static void apply_standby_screen_status_refs(void)
+{
+    battery_percent_label = g_standby_screen_refs.battery_percent_label;
+    bluetooth_icon = g_standby_screen_refs.bluetooth_icon;
+    network_icon = g_standby_screen_refs.network_icon;
+    standby_charging_icon = g_standby_screen_refs.standby_charging_icon;
+    weather_icon = g_standby_screen_refs.weather_icon;
+}
+
+static void refresh_non_dialog_screen_status(void)
+{
+    if (battery_percent_label)
+    {
+        lv_label_set_text_fmt(battery_percent_label, "%d%%", g_battery_level);
+    }
+
+    set_charge_icon();
+    time_ui_update_callback();
+    weather_ui_update_callback();
+}
+
+static void report_user_activity(void)
+{
+#ifdef BSP_USING_PM
+    lv_display_trigger_activity(NULL);
+#endif
+
+    if (lv_screen_active() == home_screen)
+    {
+        ui_restart_sleep_timer(30000);
+    }
+}
+
+static void home_screen_activity_event_handler(struct _lv_event_t *e)
+{
+    if (lv_event_get_code(e) != LV_EVENT_PRESSED)
+    {
+        return;
+    }
+
+    if (lv_event_get_target_obj(e) != home_screen)
+    {
+        return;
+    }
+
+    report_user_activity();
+}
+
+static void home_tile_event_handler(struct _lv_event_t *e)
+{
+    xiaozhi_home_tile_t tile_id;
+
+    if (lv_event_get_code(e) != LV_EVENT_CLICKED)
+    {
+        return;
+    }
+
+    tile_id = (xiaozhi_home_tile_t)(uintptr_t)lv_event_get_user_data(e);
+    report_user_activity();
+
+    if (tile_id == XIAOZHI_HOME_TILE_AI)
+    {
+        if (g_kws_running)
+        {
+            g_kws_force_exit = 1;
+        }
+        ui_switch_to_xiaozhi_screen();
+    }
+}
 
 // 更新确认弹框
 lv_obj_t *update_confirm_popup = NULL;
@@ -424,6 +517,19 @@ static void ui_restart_sleep_timer(rt_uint32_t timeout_ms)
 
 void ui_sleep_callback(lv_timer_t *timer)
 {
+    lv_obj_t *current_screen = lv_screen_active();
+
+    if (current_screen == home_screen)
+    {
+        ui_sleep_timer = NULL;
+        if (timer != NULL)
+        {
+            lv_timer_delete(timer);
+        }
+        ui_swith_to_standby_screen();
+        return;
+    }
+
     rt_kprintf("in dai_ji,so xiu mian");
     if(thiz->vad_enabled)
     {
@@ -453,11 +559,6 @@ static void standby_update_callback(lv_timer_t *timer)
     lv_timer_delete(timer);
     standby_update_timer = NULL;
 }
-
-
-
-
-
 
 static void switch_cont_anim(bool hidden);
 static void contdown_anim_ready_cb(struct _lv_anim_t* anim)
@@ -899,6 +1000,8 @@ rt_err_t xiaozhi_ui_obj_init()
     {
         xiaozhi_home_screen_config_t home_config;
         xiaozhi_home_screen_refs_t home_refs;
+        xiaozhi_home_screen_config_t standby_config;
+        xiaozhi_home_screen_refs_t standby_refs;
 
         home_config.scale = g_scale;
         home_config.battery_level = g_battery_level;
@@ -910,37 +1013,57 @@ rt_err_t xiaozhi_ui_obj_init()
         home_config.body_style = &style2;
         home_config.battery_font = font_medium;
         home_config.header_event_cb = NULL;
-        home_config.tile_event_cb = NULL;
+        home_config.tile_event_cb = home_tile_event_handler;
         home_config.enable_header_event = false;
-        home_config.enable_tile_event = false;
+        home_config.enable_tile_event = true;
 
         if (xiaozhi_home_screen_create(&home_config, &home_refs) != RT_EOK)
         {
             return -RT_ERROR;
         }
 
-        standby_screen = home_refs.screen;
+        standby_config = home_config;
+        standby_config.time_font = standby_clock_font;
+        standby_config.label_font = standby_date_font;
+        standby_config.meta_font = standby_info_font;
+        standby_config.status_font = standby_weather_font;
+        standby_config.battery_font = font_medium;
+        standby_config.tile_event_cb = NULL;
+        standby_config.enable_tile_event = false;
+
+        if (xiaozhi_standby_screen_create(&standby_config, &standby_refs) != RT_EOK)
+        {
+            return -RT_ERROR;
+        }
+
+        g_home_screen_refs = home_refs;
+        g_standby_screen_refs = standby_refs;
+        home_screen = home_refs.screen;
+        standby_screen = standby_refs.screen;
+        lv_obj_add_flag(home_screen, LV_OBJ_FLAG_CLICKABLE);
+        lv_obj_add_event_cb(home_screen,
+                            home_screen_activity_event_handler,
+                            LV_EVENT_PRESSED,
+                            NULL);
         home_time_label = home_refs.time_label;
+        standby_time_label = standby_refs.time_label;
         home_meta_label = home_refs.meta_label;
-        img_emoji = home_refs.img_emoji;
-        hour_tens_img = home_refs.hour_tens_img;
-        hour_units_img = home_refs.hour_units_img;
-        minute_tens_img = home_refs.minute_tens_img;
-        minute_units_img = home_refs.minute_units_img;
-        bluetooth_icon = home_refs.bluetooth_icon;
-        network_icon = home_refs.network_icon;
-        battery_arc = home_refs.battery_arc;
-        battery_percent_label = home_refs.battery_percent_label;
-        standby_charging_icon = home_refs.standby_charging_icon;
-        weather_icon = home_refs.weather_icon;
-        ui_Label_ip = home_refs.ui_Label_ip;
-        last_time = home_refs.last_time;
-        ui_Image_calendar = home_refs.ui_Image_calendar;
-        ui_Label_year = home_refs.ui_Label_year;
-        ui_Label_day = home_refs.ui_Label_day;
-        ui_Label_second = home_refs.ui_Label_second;
-        ui_Image_second = home_refs.ui_Image_second;
-        ui_Label3 = home_refs.ui_Label3;
+        img_emoji = standby_refs.img_emoji;
+        hour_tens_img = standby_refs.hour_tens_img;
+        hour_units_img = standby_refs.hour_units_img;
+        minute_tens_img = standby_refs.minute_tens_img;
+        minute_units_img = standby_refs.minute_units_img;
+        battery_arc = standby_refs.battery_arc;
+        ui_Label_ip = standby_refs.ui_Label_ip;
+        last_time = standby_refs.last_time;
+        ui_Image_calendar = standby_refs.ui_Image_calendar;
+        ui_Label_year = standby_refs.ui_Label_year;
+        ui_Label_lunar = standby_refs.ui_Label_lunar;
+        ui_Label_day = standby_refs.ui_Label_day;
+        ui_Label_second = standby_refs.ui_Label_second;
+        ui_Image_second = standby_refs.ui_Image_second;
+        ui_Label3 = standby_refs.ui_Label3;
+        apply_home_screen_status_refs();
         weather_bgimg = NULL;
     }
 
@@ -1275,6 +1398,17 @@ void ui_swith_to_standby_screen(void)
     }
 }
 
+void ui_switch_to_home_screen(void)
+{
+    if (ui_msg_queue != RT_NULL) {
+        ui_msg_t msg;
+        ui_msg_init(&msg, UI_MSG_SWITCH_TO_HOME);
+        if (ui_msg_send(&msg) != RT_EOK) {
+            LOG_E("Failed to send switch to home UI message");
+        }
+    }
+}
+
 void ui_switch_to_xiaozhi_screen(void)
 {
     if (ui_msg_queue != RT_NULL) {
@@ -1296,6 +1430,13 @@ void update_xiaozhi_ui_time(void *parameter)
 
 // 获取当前时间
     xiaozhi_time_get_current(&g_current_time);
+    rt_kprintf("[standby_dbg] rt_timer tick %02d:%02d:%02d queue=%p active=%p standby=%p\n",
+               g_current_time.hour,
+               g_current_time.minute,
+               g_current_time.second,
+               ui_msg_queue,
+               lv_screen_active(),
+               standby_screen);
 
     // 使用消息队列发送更新UI的消息到UI线程
     extern rt_mq_t ui_msg_queue;
@@ -1737,30 +1878,49 @@ void xiaozhi_ui_task(void *args)
         return; // 低电量模式下不执行后续的正常初始化
     }
 float scale = get_scale_factor();
-float home_scale = (float)lv_disp_get_hor_res(NULL) / 390.0f;
+lv_coord_t screen_w = lv_disp_get_hor_res(NULL);
+lv_coord_t screen_h = lv_disp_get_ver_res(NULL);
+lv_coord_t standby_short_edge = screen_w < screen_h ? screen_w : screen_h;
+float home_scale = (float)screen_w / 390.0f;
+float standby_scale = (float)standby_short_edge / 528.0f;
 
-const int medium_font_size = (int)(25 * scale + 0.5f);    // 秒显示
+const int medium_font_size = (int)(20 * scale + 0.5f);
 const int home_time_font_size = (int)(31 * home_scale + 0.5f);
-const int home_meta_font_size = (int)(13 * home_scale + 0.5f);
 const int home_label_font_size = (int)(17 * home_scale + 0.5f);
-const int home_status_font_size = (int)(13 * home_scale + 0.5f);
-// 创建不同大小的字体并赋值给全局变量
+const int standby_clock_font_size = (int)(72 * standby_scale + 0.5f);
 
+/* Keep TTF allocations small on this board to avoid starving other services. */
 font_medium = lv_tiny_ttf_create_data(xiaozhi_font, xiaozhi_font_size, medium_font_size);
 home_time_font = lv_tiny_ttf_create_data(xiaozhi_font, xiaozhi_font_size, home_time_font_size);
-home_meta_font = lv_tiny_ttf_create_data(xiaozhi_font, xiaozhi_font_size, home_meta_font_size);
 home_label_font = lv_tiny_ttf_create_data(xiaozhi_font, xiaozhi_font_size, home_label_font_size);
-home_status_font = lv_tiny_ttf_create_data(xiaozhi_font, xiaozhi_font_size, home_status_font_size);
+standby_clock_font = lv_tiny_ttf_create_data(xiaozhi_font, xiaozhi_font_size, standby_clock_font_size);
+
+if (font_medium == NULL)
+{
+    font_medium = (lv_font_t *)LV_FONT_DEFAULT;
+}
+if (home_label_font == NULL)
+{
+    home_label_font = font_medium;
+}
+if (home_time_font == NULL)
+{
+    home_time_font = home_label_font;
+}
+if (standby_clock_font == NULL)
+{
+    standby_clock_font = home_time_font;
+}
+
+home_meta_font = home_label_font;
+home_status_font = home_label_font;
+standby_date_font = font_medium;
+standby_info_font = font_medium;
+standby_weather_font = font_medium;
 
 
     g_scale = scale; // 保存全局缩放因子
     rt_kprintf("Scale factor: %.2f\n", scale);
-    const int base_font_size = 30;
-    const int adjusted_font_size = (int)(base_font_size * scale + 0.5f);
-
-    const int base_font_size_battery = 14;
-    const int adjusted_font_size_battery =
-        (int)(base_font_size_battery * scale + 0.5f);
     lv_style_init(&style2);
      lv_style_set_text_font(&style2, font_medium);
     lv_style_set_text_align(&style2, LV_TEXT_ALIGN_CENTER);
@@ -1768,9 +1928,7 @@ home_status_font = lv_tiny_ttf_create_data(xiaozhi_font, xiaozhi_font_size, home
  
 
     lv_style_init(&style);
-    lv_font_t *font = lv_tiny_ttf_create_data(xiaozhi_font, xiaozhi_font_size,
-                                              adjusted_font_size);
-    lv_style_set_text_font(&style, font);
+    lv_style_set_text_font(&style, home_label_font);
     lv_style_set_text_align(&style, LV_TEXT_ALIGN_CENTER);
     lv_style_set_text_color(&style, lv_color_hex(0xFFFFFF));
     lv_obj_set_style_bg_color(lv_screen_active(), lv_color_hex(0x000000),
@@ -1876,6 +2034,7 @@ home_status_font = lv_tiny_ttf_create_data(xiaozhi_font, xiaozhi_font_size, home
             switch (btn_event)
             {
             case BUTTON_EVENT_PRESSED:
+                    report_user_activity();
                     ws_send_speak_abort(&g_xz_ws.clnt, g_xz_ws.session_id,kAbortReasonWakeWordDetected);                                           
                     xz_speaker(0); // 关闭扬声器
 					rt_kprintf("vad_enabled jjjjjk\n");
@@ -1891,6 +2050,7 @@ home_status_font = lv_tiny_ttf_create_data(xiaozhi_font, xiaozhi_font_size, home
                 break;
                 
             case BUTTON_EVENT_RELEASED:
+                report_user_activity();
                 xiaozhi_ui_chat_status("待命中...");
 #if !PKG_XIAOZHI_USING_AEC  
                 ws_send_listen_stop(&g_xz_ws.clnt, g_xz_ws.session_id);
@@ -1965,9 +2125,11 @@ home_status_font = lv_tiny_ttf_create_data(xiaozhi_font, xiaozhi_font_size, home
                         }
 
                         lv_screen_load(standby_screen);
+                        apply_standby_screen_status_refs();
                         lv_obj_set_parent(cont, lv_screen_active());
                         lv_obj_set_parent(update_confirm_popup, lv_screen_active());
                         lv_obj_move_foreground(cont);
+                        refresh_non_dialog_screen_status();
                         }
 
                         // mic关闭，开启KWS
@@ -1990,7 +2152,29 @@ home_status_font = lv_tiny_ttf_create_data(xiaozhi_font, xiaozhi_font_size, home
                         // 创建定时器，稍后执行更新
                         standby_update_timer = lv_timer_create(standby_update_callback, 100, NULL);
 
-                    
+                    break;
+
+                case UI_MSG_SWITCH_TO_HOME:
+                    if (home_screen) {
+                        if(ui_sleep_timer)
+                        {
+                            lv_timer_delete(ui_sleep_timer);
+                            ui_sleep_timer = NULL;
+                        }
+
+                        lv_screen_load(home_screen);
+                        apply_home_screen_status_refs();
+                        lv_obj_set_parent(cont, lv_screen_active());
+                        lv_obj_set_parent(update_confirm_popup, lv_screen_active());
+                        lv_obj_move_foreground(cont);
+                        refresh_non_dialog_screen_status();
+                    }
+                    xz_aec_mic_close(thiz);
+                    if(aec_enabled)
+                    {
+                        kws_demo();
+                    }
+                    ui_restart_sleep_timer(30000);
                     break;
                     
                 case UI_MSG_SWITCH_TO_MAIN:
@@ -2013,11 +2197,26 @@ home_status_font = lv_tiny_ttf_create_data(xiaozhi_font, xiaozhi_font_size, home
                         g_kws_force_exit = 0;
                         kws_demo_stop();
                     }
+#ifdef XIAOZHI_USING_MQTT
+                    if (mqtt_g_state == kDeviceStateIdle)
+                    {
+                        mqtt_listen_start(&g_xz_context, kListeningModeAlwaysOn);
+                    }
+#else
+                    if (g_xz_ws.is_connected)
+                    {
+                        ws_send_listen_start(&g_xz_ws.clnt,
+                                             g_xz_ws.session_id,
+                                             kListeningModeAlwaysOn);
+                    }
+#endif
                     break;
                 case UI_MSG_WEATHER_UPDATE:
                     weather_ui_update_callback();
                     break;
                 case UI_MSG_TIME_UPDATE:
+                    rt_kprintf("[standby_dbg] UI_MSG_TIME_UPDATE active=%p standby=%p\n",
+                               lv_screen_active(), standby_screen);
                     time_ui_update_callback();
                     break;
                 case UI_MSG_CHAT_STATUS:
@@ -2414,16 +2613,25 @@ home_status_font = lv_tiny_ttf_create_data(xiaozhi_font, xiaozhi_font_size, home
         }
         if (RT_EOK == rt_sem_trytake(&update_ui_sema))
         {
+            lv_obj_t *xiaozhi_screen_obj = NULL;
+            rt_bool_t is_xiaozhi_screen = RT_FALSE;
             ms = lv_task_handler();
             switch_anim_timeout_check();
 
             char *current_text = lv_label_get_text(global_label1);
             lv_obj_t *current_screen = lv_screen_active();
+            if (main_container)
+            {
+                xiaozhi_screen_obj = lv_obj_get_screen(main_container);
+                is_xiaozhi_screen = (current_screen == xiaozhi_screen_obj);
+            }
+
             //rt_kprintf("current_screen: %p, main_container: %p\n", current_screen, main_container);
             //rt_kprintf("inactive_time: %d, limit: %d\n", lv_display_get_inactive_time(NULL), IDLE_TIME_LIMIT);
-            if (lv_display_get_inactive_time(NULL) > IDLE_TIME_LIMIT && current_screen != standby_screen && current_screen != g_startup_screen && current_screen != shutdown_screen &&
-    current_screen != sleep_screen && current_screen != low_battery_shutdown_screen && g_pan_connected) //如果当前满足了屏幕不活跃的时间，并且当前屏幕不是待机屏幕，当前屏幕不是开机启动屏幕，当前屏幕不是关机屏幕，当前屏幕不是睡眠屏幕
-            {                       //加这些条件的限制是为了保证只有在对话界面才会进入休眠阶段
+            if (lv_display_get_inactive_time(NULL) > IDLE_TIME_LIMIT &&
+                is_xiaozhi_screen &&
+                g_pan_connected)
+            {
 
                 rt_kprintf("listen_tick\n");
                 last_listen_tick= 1;

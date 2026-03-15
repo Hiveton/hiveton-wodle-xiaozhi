@@ -138,6 +138,12 @@ static unsigned char LUT_Flag = 0; // LUT切换标志
 static unsigned char Var_Temp = 0; // 温度值
 static rt_tick_t s_last_epd_refresh_tick = 0;
 static uint8_t s_frame_collecting = 0;
+static uint8_t s_dirty_area_valid = 0;
+static uint16_t s_dirty_x0 = 0;
+static uint16_t s_dirty_y0 = 0;
+static uint16_t s_dirty_x1 = 0;
+static uint16_t s_dirty_y1 = 0;
+static uint8_t s_partial_refresh_count = 0;
 
 static LCDC_InitTypeDef lcdc_int_cfg = {
     .lcd_itf = LCDC_INTF_SPI_DCX_1DATA,
@@ -174,17 +180,39 @@ static void EPD_ReadBusy(void);
 static void EPD_SendCommandDataBuf(LCDC_HandleTypeDef *hlcdc, uint8_t cmd,
                                    const uint8_t *data, uint16_t len);
 static void EPD_SetFullWindow(LCDC_HandleTypeDef *hlcdc);
+static void EPD_SetPartialWindow(LCDC_HandleTypeDef *hlcdc, uint16_t x0,
+                                 uint16_t y0, uint16_t x1, uint16_t y1);
+static void EPD_FrameBuffer_FlushRegion(LCDC_HandleTypeDef *hlcdc, uint16_t x0,
+                                        uint16_t y0, uint16_t x1, uint16_t y1);
+static void EPD_FrameBuffer_FlushFast(LCDC_HandleTypeDef *hlcdc);
+static void EPD_MarkDirtyPhysicalRegion(uint16_t x0, uint16_t y0, uint16_t x1,
+                                        uint16_t y1);
+static void EPD_MarkDirtyLogicalRegion(uint16_t x0, uint16_t y0, uint16_t x1,
+                                       uint16_t y1);
+static void EPD_ClearDirtyRegion(void);
+static uint8_t EPD_ShouldUseFullRefresh(uint16_t x0, uint16_t y0, uint16_t x1,
+                                        uint16_t y1);
+static uint8_t *EPD_AllocMonoRegionBuffer(const uint8_t *src, uint16_t x0,
+                                          uint16_t y0, uint16_t x1,
+                                          uint16_t y1, uint32_t *out_len);
 
 L2_NON_RET_BSS_SECT_BEGIN(frambuf)
 L2_NON_RET_BSS_SECT(frambuf,
                     ALIGN(64) static uint8_t mixed_framebuffer[EPD_GRAY2_FRAME_SIZE]);
 L2_NON_RET_BSS_SECT(frambuf,
                     ALIGN(64) static uint8_t mixed_framebuffer_mono[EPD_MONO_FRAME_SIZE]);
+L2_NON_RET_BSS_SECT(frambuf,
+                    ALIGN(64) static uint8_t mixed_framebuffer_prev_mono[EPD_MONO_FRAME_SIZE]);
 L2_NON_RET_BSS_SECT_END
 
 static uint8_t framebuffer_initialized = 0;
 
 static rt_sem_t epd_busy_sem = RT_NULL;
+
+static unsigned int epd_ticks_to_ms(rt_tick_t ticks)
+{
+    return (unsigned int)(((uint64_t)ticks * 1000U) / RT_TICK_PER_SECOND);
+}
 
 static inline uint8_t epd_clamp_gray2(uint8_t lv)
 {
@@ -248,6 +276,179 @@ static void EPD_Gray2ToMonoDither(void)
     }
 }
 
+static void EPD_MarkDirtyPhysicalRegion(uint16_t x0, uint16_t y0, uint16_t x1,
+                                        uint16_t y1)
+{
+    if (x0 > x1 || y0 > y1)
+    {
+        return;
+    }
+
+    if (x1 >= EPD_WIDTH) x1 = EPD_WIDTH - 1;
+    if (y1 >= EPD_HEIGHT) y1 = EPD_HEIGHT - 1;
+
+    if (!s_dirty_area_valid)
+    {
+        s_dirty_x0 = x0;
+        s_dirty_y0 = y0;
+        s_dirty_x1 = x1;
+        s_dirty_y1 = y1;
+        s_dirty_area_valid = 1;
+        return;
+    }
+
+    if (x0 < s_dirty_x0) s_dirty_x0 = x0;
+    if (y0 < s_dirty_y0) s_dirty_y0 = y0;
+    if (x1 > s_dirty_x1) s_dirty_x1 = x1;
+    if (y1 > s_dirty_y1) s_dirty_y1 = y1;
+}
+
+static void EPD_MarkDirtyLogicalRegion(uint16_t x0, uint16_t y0, uint16_t x1,
+                                       uint16_t y1)
+{
+    if (x0 > x1 || y0 > y1)
+    {
+        return;
+    }
+
+    if (x1 >= EPD_LOGICAL_WIDTH) x1 = EPD_LOGICAL_WIDTH - 1;
+    if (y1 >= EPD_LOGICAL_HEIGHT) y1 = EPD_LOGICAL_HEIGHT - 1;
+
+    EPD_MarkDirtyPhysicalRegion(y0, (uint16_t)(EPD_HEIGHT - 1U - x1),
+                                y1, (uint16_t)(EPD_HEIGHT - 1U - x0));
+}
+
+static void EPD_ClearDirtyRegion(void)
+{
+    s_dirty_area_valid = 0;
+    s_dirty_x0 = 0;
+    s_dirty_y0 = 0;
+    s_dirty_x1 = 0;
+    s_dirty_y1 = 0;
+}
+
+static uint8_t EPD_ShouldUseFullRefresh(uint16_t x0, uint16_t y0, uint16_t x1,
+                                        uint16_t y1)
+{
+    uint32_t dirty_pixels = (uint32_t)(x1 - x0 + 1U) * (uint32_t)(y1 - y0 + 1U);
+    uint32_t full_pixels = (uint32_t)EPD_WIDTH * (uint32_t)EPD_HEIGHT;
+
+    if (dirty_pixels * 2U >= full_pixels)
+    {
+        return 1;
+    }
+
+    if (s_partial_refresh_count >= PART_DISP_TIMES)
+    {
+        return 1;
+    }
+
+    return 0;
+}
+
+static void EPD_GetEffectiveUpdateRegion(LCDC_HandleTypeDef *hlcdc,
+                                         uint16_t src_x0, uint16_t src_y0,
+                                         uint16_t src_x1, uint16_t src_y1,
+                                         uint16_t *upd_x0, uint16_t *upd_y0,
+                                         uint16_t *upd_x1, uint16_t *upd_y1)
+{
+    if (upd_x0 == NULL || upd_y0 == NULL || upd_x1 == NULL || upd_y1 == NULL)
+    {
+        return;
+    }
+
+    *upd_x0 = src_x0;
+    *upd_y0 = src_y0;
+    *upd_x1 = src_x1;
+    *upd_y1 = src_y1;
+
+    if (hlcdc == NULL)
+    {
+        return;
+    }
+
+    if ((hlcdc->roi.x0 <= hlcdc->roi.x1) && (hlcdc->roi.y0 <= hlcdc->roi.y1))
+    {
+        uint16_t roi_x0 = (uint16_t)hlcdc->roi.x0;
+        uint16_t roi_y0 = (uint16_t)hlcdc->roi.y0;
+        uint16_t roi_x1 = (uint16_t)hlcdc->roi.x1;
+        uint16_t roi_y1 = (uint16_t)hlcdc->roi.y1;
+
+        if (roi_x0 < *upd_x0) roi_x0 = *upd_x0;
+        if (roi_y0 < *upd_y0) roi_y0 = *upd_y0;
+        if (roi_x1 > *upd_x1) roi_x1 = *upd_x1;
+        if (roi_y1 > *upd_y1) roi_y1 = *upd_y1;
+
+        if (roi_x0 <= roi_x1 && roi_y0 <= roi_y1)
+        {
+            *upd_x0 = roi_x0;
+            *upd_y0 = roi_y0;
+            *upd_x1 = roi_x1;
+            *upd_y1 = roi_y1;
+        }
+    }
+}
+
+static uint8_t EPD_ShouldFlushCurrentROI(LCDC_HandleTypeDef *hlcdc,
+                                         uint16_t upd_x1, uint16_t upd_y1)
+{
+    if (hlcdc == NULL)
+    {
+        return 1;
+    }
+
+    if ((hlcdc->roi.x0 <= hlcdc->roi.x1) && (hlcdc->roi.y0 <= hlcdc->roi.y1))
+    {
+        return (upd_x1 >= (uint16_t)hlcdc->roi.x1) &&
+               (upd_y1 >= (uint16_t)hlcdc->roi.y1);
+    }
+
+    return 1;
+}
+
+static uint8_t *EPD_AllocMonoRegionBuffer(const uint8_t *src, uint16_t x0,
+                                          uint16_t y0, uint16_t x1,
+                                          uint16_t y1, uint32_t *out_len)
+{
+    uint16_t src_stride = (uint16_t)(EPD_WIDTH / 8U);
+    uint16_t x0_byte = (uint16_t)(x0 / 8U);
+    uint16_t x1_byte = (uint16_t)(x1 / 8U);
+    uint16_t row_bytes = (uint16_t)(x1_byte - x0_byte + 1U);
+    uint16_t height = (uint16_t)(y1 - y0 + 1U);
+    uint32_t buf_len = (uint32_t)row_bytes * (uint32_t)height;
+    uint8_t *buf;
+
+    if (out_len != NULL)
+    {
+        *out_len = 0;
+    }
+
+    if (src == NULL || row_bytes == 0U || height == 0U)
+    {
+        return RT_NULL;
+    }
+
+    buf = rt_malloc(buf_len);
+    if (buf == RT_NULL)
+    {
+        rt_kprintf("EPD region alloc failed, len=%lu\n", (unsigned long)buf_len);
+        return RT_NULL;
+    }
+
+    for (uint16_t row = 0; row < height; row++)
+    {
+        const uint8_t *src_row = src + ((uint32_t)(y0 + row) * src_stride) + x0_byte;
+        memcpy(buf + ((uint32_t)row * row_bytes), src_row, row_bytes);
+    }
+
+    if (out_len != NULL)
+    {
+        *out_len = buf_len;
+    }
+
+    return buf;
+}
+
 /**
  * @brief 初始化帧缓冲区为全白
  */
@@ -255,7 +456,10 @@ static void EPD_FrameBuffer_Init(void)
 {
     memset(mixed_framebuffer, 0xFF, sizeof(mixed_framebuffer)); /* default white (3) by packed bytes */
     memset(mixed_framebuffer_mono, 0xFF, sizeof(mixed_framebuffer_mono));
+    memset(mixed_framebuffer_prev_mono, 0xFF, sizeof(mixed_framebuffer_prev_mono));
     framebuffer_initialized = 1;
+    EPD_ClearDirtyRegion();
+    s_partial_refresh_count = 0;
 }
 
 /**
@@ -308,6 +512,48 @@ static void EPD_FrameBuffer_UpdateRegion(const uint8_t *data, uint16_t x0, uint1
     }
 }
 
+static void EPD_FrameBuffer_UpdateRegionFromSrcArea(const uint8_t *data,
+                                                    uint16_t src_x0, uint16_t src_y0,
+                                                    uint16_t src_x1, uint16_t src_y1,
+                                                    uint16_t upd_x0, uint16_t upd_y0,
+                                                    uint16_t upd_x1, uint16_t upd_y1)
+{
+    if (data == NULL || src_x0 > src_x1 || src_y0 > src_y1 ||
+        upd_x0 > upd_x1 || upd_y0 > upd_y1)
+    {
+        return;
+    }
+
+    if (upd_x0 < src_x0 || upd_y0 < src_y0 || upd_x1 > src_x1 || upd_y1 > src_y1)
+    {
+        return;
+    }
+
+    if (!framebuffer_initialized)
+    {
+        EPD_FrameBuffer_Init();
+    }
+
+    uint16_t src_width = (uint16_t)(src_x1 - src_x0 + 1U);
+
+    for (uint16_t y = upd_y0; y <= upd_y1; y++)
+    {
+        for (uint16_t x = upd_x0; x <= upd_x1; x++)
+        {
+            uint32_t src_idx = (uint32_t)(y - src_y0) * src_width + (uint32_t)(x - src_x0);
+            uint8_t pixel = data[src_idx];
+            uint8_t r = (pixel >> 5) & 0x07;
+            uint8_t g = (pixel >> 2) & 0x07;
+            uint8_t b = pixel & 0x03;
+            uint16_t gray = (uint16_t)r * 36 + (uint16_t)g * 36 + (uint16_t)b * 64;
+            uint8_t gray2 = (gray < 64) ? 0 : (gray < 128) ? 1 : (gray < 192) ? 2 : 3;
+            uint16_t px, py;
+            epd_map_logical_to_physical(x, y, &px, &py);
+            epd_set_gray2_pixel(px, py, gray2);
+        }
+    }
+}
+
 static void EPD_FrameBuffer_UpdateRegionRGB565(const uint8_t *data, uint16_t x0, uint16_t y0,
                                                 uint16_t x1, uint16_t y1)
 {
@@ -332,6 +578,54 @@ static void EPD_FrameBuffer_UpdateRegionRGB565(const uint8_t *data, uint16_t x0,
         {
             uint32_t src_idx = (uint32_t)((y - y0) * src_width + (x - x0));
             uint16_t pixel565 = (uint16_t)data[src_idx * 2] | ((uint16_t)data[src_idx * 2 + 1] << 8);
+
+            uint8_t r5 = (uint8_t)((pixel565 >> 11) & 0x1F);
+            uint8_t g6 = (uint8_t)((pixel565 >> 5) & 0x3F);
+            uint8_t b5 = (uint8_t)(pixel565 & 0x1F);
+            uint8_t r8 = (uint8_t)((r5 << 3) | (r5 >> 2));
+            uint8_t g8 = (uint8_t)((g6 << 2) | (g6 >> 4));
+            uint8_t b8 = (uint8_t)((b5 << 3) | (b5 >> 2));
+
+            uint16_t gray = (uint16_t)(r8 * 30 + g8 * 59 + b8 * 11) / 100;
+            uint8_t gray2 = (gray < 64) ? 0 : (gray < 128) ? 1 : (gray < 192) ? 2 : 3;
+            uint16_t px, py;
+            epd_map_logical_to_physical(x, y, &px, &py);
+            epd_set_gray2_pixel(px, py, gray2);
+        }
+    }
+}
+
+static void EPD_FrameBuffer_UpdateRegionRGB565FromSrcArea(const uint8_t *data,
+                                                          uint16_t src_x0, uint16_t src_y0,
+                                                          uint16_t src_x1, uint16_t src_y1,
+                                                          uint16_t upd_x0, uint16_t upd_y0,
+                                                          uint16_t upd_x1, uint16_t upd_y1)
+{
+    if (data == NULL || src_x0 > src_x1 || src_y0 > src_y1 ||
+        upd_x0 > upd_x1 || upd_y0 > upd_y1)
+    {
+        return;
+    }
+
+    if (upd_x0 < src_x0 || upd_y0 < src_y0 || upd_x1 > src_x1 || upd_y1 > src_y1)
+    {
+        return;
+    }
+
+    if (!framebuffer_initialized)
+    {
+        EPD_FrameBuffer_Init();
+    }
+
+    uint16_t src_width = (uint16_t)(src_x1 - src_x0 + 1U);
+
+    for (uint16_t y = upd_y0; y <= upd_y1; y++)
+    {
+        for (uint16_t x = upd_x0; x <= upd_x1; x++)
+        {
+            uint32_t src_idx = (uint32_t)(y - src_y0) * src_width + (uint32_t)(x - src_x0);
+            uint16_t pixel565 = (uint16_t)data[src_idx * 2U] |
+                                ((uint16_t)data[src_idx * 2U + 1U] << 8);
 
             uint8_t r5 = (uint8_t)((pixel565 >> 11) & 0x1F);
             uint8_t g6 = (uint8_t)((pixel565 >> 5) & 0x3F);
@@ -400,6 +694,9 @@ static void EPD_FrameBuffer_UpdateRegion1bpp(const uint8_t *data, uint16_t x0, u
  */
 static void EPD_FrameBuffer_Flush(LCDC_HandleTypeDef *hlcdc)
 {
+    rt_tick_t refresh_start;
+    rt_tick_t refresh_end;
+
     if (!framebuffer_initialized)
     {
         EPD_FrameBuffer_Init();
@@ -422,7 +719,54 @@ static void EPD_FrameBuffer_Flush(LCDC_HandleTypeDef *hlcdc)
                            EPD_MONO_FRAME_SIZE);
     
     // 刷新显示
+    refresh_start = rt_tick_get();
     EPD_Refresh(hlcdc);
+    refresh_end = rt_tick_get();
+    rt_kprintf("[standby_dbg] epd full refresh done elapsed=%u ms\n",
+               epd_ticks_to_ms(refresh_end - refresh_start));
+    memcpy(mixed_framebuffer_prev_mono, mixed_framebuffer_mono,
+           sizeof(mixed_framebuffer_prev_mono));
+    s_partial_refresh_count = 0;
+    EPD_ClearDirtyRegion();
+}
+
+static void EPD_FrameBuffer_FlushFast(LCDC_HandleTypeDef *hlcdc)
+{
+    rt_tick_t refresh_start;
+    rt_tick_t refresh_end;
+
+    if (!framebuffer_initialized)
+    {
+        EPD_FrameBuffer_Init();
+    }
+
+    EPD_ReadBusy();
+    EPD_LoadLUT(hlcdc, 2);
+
+#if EPD_USE_SCAN_MODE3
+    EPD_SetFullWindow(hlcdc);
+#endif
+
+    EPD_Gray2ToMonoDither();
+    EPD_SendCommandDataBuf(hlcdc, 0x10, mixed_framebuffer_prev_mono,
+                           EPD_MONO_FRAME_SIZE);
+    EPD_SendCommandDataBuf(hlcdc, REG_WRITE_NEW_DATA, mixed_framebuffer_mono,
+                           EPD_MONO_FRAME_SIZE);
+
+    refresh_start = rt_tick_get();
+    EPD_Refresh(hlcdc);
+    refresh_end = rt_tick_get();
+    rt_kprintf("[standby_dbg] epd fast full refresh done elapsed=%u ms partial_count=%u\n",
+               epd_ticks_to_ms(refresh_end - refresh_start),
+               (unsigned int)s_partial_refresh_count);
+
+    memcpy(mixed_framebuffer_prev_mono, mixed_framebuffer_mono,
+           sizeof(mixed_framebuffer_prev_mono));
+    if (s_partial_refresh_count < 0xFF)
+    {
+        s_partial_refresh_count++;
+    }
+    EPD_ClearDirtyRegion();
 }
 
 /**
@@ -432,7 +776,10 @@ static void EPD_FrameBuffer_Clear(void)
 {
     memset(mixed_framebuffer, 0xFF, sizeof(mixed_framebuffer));
     memset(mixed_framebuffer_mono, 0xFF, sizeof(mixed_framebuffer_mono));
+    memset(mixed_framebuffer_prev_mono, 0xFF, sizeof(mixed_framebuffer_prev_mono));
     framebuffer_initialized = 1;
+    EPD_ClearDirtyRegion();
+    s_partial_refresh_count = 0;
 }
 
 static void EPD_DrawCenteredCircleTest(void)
@@ -519,6 +866,122 @@ static void EPD_SetFullWindow(LCDC_HandleTypeDef *hlcdc)
     };
     EPD_SendCommand(hlcdc, 0x91);
     EPD_SendCommandDataBuf(hlcdc, 0x90, win, sizeof(win));
+}
+
+static void EPD_SetPartialWindow(LCDC_HandleTypeDef *hlcdc, uint16_t x0,
+                                 uint16_t y0, uint16_t x1, uint16_t y1)
+{
+    uint16_t x_start = (uint16_t)(x0 & ~0x7u);
+    uint16_t x_end = (uint16_t)(x1 | 0x7u);
+    uint16_t y_start = (uint16_t)(EPD_WIN_Y_START + y0);
+    uint16_t y_end = (uint16_t)(EPD_WIN_Y_START + y1);
+    uint8_t win[9] = {
+        (uint8_t)(x_start >> 8), (uint8_t)(x_start & 0xFF),
+        (uint8_t)(x_end >> 8), (uint8_t)(x_end & 0xFF),
+        (uint8_t)(y_start >> 8), (uint8_t)(y_start & 0xFF),
+        (uint8_t)(y_end >> 8), (uint8_t)(y_end & 0xFF),
+        0x01
+    };
+
+    if (x_end >= EPD_SCAN_SRC_PIXELS) x_end = EPD_SCAN_SRC_PIXELS - 1;
+    if (y_end >= EPD_SCAN_GATE_PIXELS) y_end = EPD_SCAN_GATE_PIXELS - 1;
+    win[2] = (uint8_t)(x_end >> 8);
+    win[3] = (uint8_t)(x_end & 0xFF);
+    win[6] = (uint8_t)(y_end >> 8);
+    win[7] = (uint8_t)(y_end & 0xFF);
+
+    EPD_SendCommand(hlcdc, 0x91);
+    EPD_SendCommandDataBuf(hlcdc, 0x90, win, sizeof(win));
+}
+
+static void EPD_FrameBuffer_FlushRegion(LCDC_HandleTypeDef *hlcdc, uint16_t x0,
+                                        uint16_t y0, uint16_t x1, uint16_t y1)
+{
+    uint8_t *old_region;
+    uint8_t *new_region;
+    uint32_t old_len;
+    uint32_t new_len;
+    rt_tick_t refresh_start;
+    rt_tick_t refresh_end;
+    uint16_t src_stride;
+    uint16_t x0_byte;
+    uint16_t x1_byte;
+    uint16_t row_bytes;
+
+    if (!framebuffer_initialized)
+    {
+        EPD_FrameBuffer_Init();
+    }
+
+    x0 = (uint16_t)(x0 & ~0x7u);
+    x1 = (uint16_t)(x1 | 0x7u);
+    if (x1 >= EPD_WIDTH) x1 = EPD_WIDTH - 1;
+    if (y1 >= EPD_HEIGHT) y1 = EPD_HEIGHT - 1;
+
+    EPD_ReadBusy();
+    EPD_LoadLUT(hlcdc, 2);
+    EPD_Gray2ToMonoDither();
+    EPD_SetPartialWindow(hlcdc, x0, y0, x1, y1);
+
+    old_region = EPD_AllocMonoRegionBuffer(mixed_framebuffer_prev_mono, x0, y0,
+                                           x1, y1, &old_len);
+    if (old_region == RT_NULL)
+    {
+        rt_kprintf("EPD partial old region alloc failed, fallback to full refresh\n");
+        EPD_FrameBuffer_Flush(hlcdc);
+        return;
+    }
+
+    new_region = EPD_AllocMonoRegionBuffer(mixed_framebuffer_mono, x0, y0, x1,
+                                           y1, &new_len);
+    if (new_region == RT_NULL)
+    {
+        rt_free(old_region);
+        rt_kprintf("EPD partial new region alloc failed, fallback to full refresh\n");
+        EPD_FrameBuffer_Flush(hlcdc);
+        return;
+    }
+
+    if (old_len != new_len)
+    {
+        rt_kprintf("EPD partial region len mismatch old=%lu new=%lu\n",
+                   (unsigned long)old_len, (unsigned long)new_len);
+        rt_free(old_region);
+        rt_free(new_region);
+        EPD_FrameBuffer_Flush(hlcdc);
+        return;
+    }
+
+    EPD_SendCommandDataBuf(hlcdc, 0x10, old_region, (uint16_t)old_len);
+    EPD_SendCommandDataBuf(hlcdc, 0x13, new_region, (uint16_t)new_len);
+    refresh_start = rt_tick_get();
+    EPD_Refresh(hlcdc);
+    refresh_end = rt_tick_get();
+    rt_kprintf("[standby_dbg] epd partial refresh done area=(%d,%d)-(%d,%d) elapsed=%u ms partial_count=%u\n",
+               x0, y0, x1, y1,
+               epd_ticks_to_ms(refresh_end - refresh_start),
+               (unsigned int)s_partial_refresh_count);
+
+    rt_free(old_region);
+    rt_free(new_region);
+
+    src_stride = (uint16_t)(EPD_WIDTH / 8U);
+    x0_byte = (uint16_t)(x0 / 8U);
+    x1_byte = (uint16_t)(x1 / 8U);
+    row_bytes = (uint16_t)(x1_byte - x0_byte + 1U);
+
+    for (uint16_t row = y0; row <= y1; row++)
+    {
+        uint8_t *dst = mixed_framebuffer_prev_mono + ((uint32_t)row * src_stride) + x0_byte;
+        const uint8_t *src = mixed_framebuffer_mono + ((uint32_t)row * src_stride) + x0_byte;
+        memcpy(dst, src, row_bytes);
+    }
+
+    if (s_partial_refresh_count < 0xFF)
+    {
+        s_partial_refresh_count++;
+    }
+    EPD_ClearDirtyRegion();
 }
 static void epd_busy_callback(void *args)
 {
@@ -783,6 +1246,7 @@ static void LCD_WritePixel(LCDC_HandleTypeDef *hlcdc, uint16_t Xpos,
     {
         EPD_FrameBuffer_UpdateRegion(RGBCode, Xpos, Ypos, Xpos, Ypos);
     }
+    EPD_MarkDirtyLogicalRegion(Xpos, Ypos, Xpos, Ypos);
     
     // 注意: 单像素写入不会立即刷新屏幕，需要调用者手动触发刷新
     // 如果需要立即刷新，取消下面的注释
@@ -794,34 +1258,51 @@ static void LCD_WriteMultiplePixels(LCDC_HandleTypeDef *hlcdc,
                                     uint16_t Ypos0, uint16_t Xpos1,
                                     uint16_t Ypos1)
 {
+    uint8_t should_flush_now;
+    uint16_t upd_x0;
+    uint16_t upd_y0;
+    uint16_t upd_x1;
+    uint16_t upd_y1;
+
     if (RGBCode == NULL || Xpos0 > Xpos1 || Ypos0 > Ypos1)
     {
         rt_kprintf("EPD multiple pixels param error\n");
         return;
     }
-    rt_kprintf("EPD multiple pixels: (%d,%d)-(%d,%d)\n",
-               Xpos0, Ypos0, Xpos1, Ypos1);
+    EPD_GetEffectiveUpdateRegion(hlcdc, Xpos0, Ypos0, Xpos1, Ypos1,
+                                 &upd_x0, &upd_y0, &upd_x1, &upd_y1);
+    rt_kprintf("EPD multiple pixels src:(%d,%d)-(%d,%d) roi:(%d,%d)-(%d,%d)\n",
+               Xpos0, Ypos0, Xpos1, Ypos1, upd_x0, upd_y0, upd_x1, upd_y1);
 
-    /* 仅支持全局刷新：开始收集新一帧时先白底清空，避免上帧残留条带叠加 */
     if (!s_frame_collecting)
     {
-        EPD_FrameBuffer_Clear();
         s_frame_collecting = 1;
     }
 
-    // 更新帧缓冲区对应区域
     if (g_input_color_mode == RTGRAPHIC_PIXEL_FORMAT_RGB565 ||
         g_input_color_mode == LCDC_PIXEL_FORMAT_RGB565)
     {
-        EPD_FrameBuffer_UpdateRegionRGB565(RGBCode, Xpos0, Ypos0, Xpos1, Ypos1);
+        EPD_FrameBuffer_UpdateRegionRGB565FromSrcArea(RGBCode, Xpos0, Ypos0,
+                                                      Xpos1, Ypos1, upd_x0,
+                                                      upd_y0, upd_x1, upd_y1);
     }
     else
     {
-        EPD_FrameBuffer_UpdateRegion(RGBCode, Xpos0, Ypos0, Xpos1, Ypos1);
+        EPD_FrameBuffer_UpdateRegionFromSrcArea(RGBCode, Xpos0, Ypos0, Xpos1,
+                                                Ypos1, upd_x0, upd_y0,
+                                                upd_x1, upd_y1);
     }
-    
-    /* 该屏只支持全局刷新：只在收到“最后一片”时触发一次全刷。 */
-    if (Ypos1 >= (EPD_LOGICAL_HEIGHT - 1))
+    EPD_MarkDirtyLogicalRegion(upd_x0, upd_y0, upd_x1, upd_y1);
+    should_flush_now = EPD_ShouldFlushCurrentROI(hlcdc, upd_x1, upd_y1);
+
+    if (!should_flush_now)
+    {
+        rt_kprintf("[standby_dbg] epd defer flush src=(%d,%d)-(%d,%d) roi=(%d,%d)-(%d,%d) dirty=(%d,%d)-(%d,%d)\n",
+                   Xpos0, Ypos0, Xpos1, Ypos1,
+                   hlcdc->roi.x0, hlcdc->roi.y0, hlcdc->roi.x1, hlcdc->roi.y1,
+                   s_dirty_x0, s_dirty_y0, s_dirty_x1, s_dirty_y1);
+    }
+    else
     {
         rt_tick_t min_interval = rt_tick_from_millisecond(300);
         rt_tick_t now = rt_tick_get();
@@ -832,6 +1313,10 @@ static void LCD_WriteMultiplePixels(LCDC_HandleTypeDef *hlcdc,
             rt_thread_delay(min_interval - elapsed);
         }
 
+        rt_kprintf("[standby_dbg] epd forced gc full flush src=(%d,%d)-(%d,%d) dirty_valid=%d dirty=(%d,%d)-(%d,%d)\n",
+                   Xpos0, Ypos0, Xpos1, Ypos1,
+                   s_dirty_area_valid,
+                   s_dirty_x0, s_dirty_y0, s_dirty_x1, s_dirty_y1);
         EPD_FrameBuffer_Flush(hlcdc);
         s_last_epd_refresh_tick = rt_tick_get();
         s_frame_collecting = 0;
@@ -1049,18 +1534,20 @@ static void EPD_TemperatureMeasure(LCDC_HandleTypeDef *hlcdc)
     // rt_kprintf("EPD internal temp: %d °C", (int8_t)Var_Temp);
 }
 
-static const LCD_DrvOpsDef epd_spi_drv = {LCD_Init,
-                                          LCD_ReadID,
-                                          LCD_DisplayOn,
-                                          LCD_DisplayOff,
-                                          LCD_SetRegion,
-                                          LCD_WritePixel,
-                                          LCD_WriteMultiplePixels,
-                                          LCD_ReadPixel,
-                                          LCD_SetColorMode,
-                                          LCD_SetBrightness,
-                                          LCD_IdleModeOn,
-                                          LCD_IdleModeOff};
+static const LCD_DrvOpsDef epd_spi_drv = {
+    .Init = LCD_Init,
+    .ReadID = LCD_ReadID,
+    .DisplayOn = LCD_DisplayOn,
+    .DisplayOff = LCD_DisplayOff,
+    .SetRegion = LCD_SetRegion,
+    .WritePixel = LCD_WritePixel,
+    .WriteMultiplePixels = LCD_WriteMultiplePixels,
+    .ReadPixel = LCD_ReadPixel,
+    .SetColorMode = LCD_SetColorMode,
+    .SetBrightness = LCD_SetBrightness,
+    .IdleModeOn = LCD_IdleModeOn,
+    .IdleModeOff = LCD_IdleModeOff,
+};
 
 LCD_DRIVER_EXPORT(epd_spi, EPD_LCD_ID, &lcdc_int_cfg, &epd_spi_drv,
                   LCD_PIXEL_WIDTH, LCD_PIXEL_HEIGHT, 16);

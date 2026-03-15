@@ -1,3 +1,4 @@
+#include <stdint.h>
 #include "ui/home/home_screen.h"
 
 #define HOME_DESIGN_W 390
@@ -64,6 +65,8 @@ static lv_obj_t *create_status_icon(lv_obj_t *parent,
 }
 
 static lv_obj_t *create_grid_item(lv_obj_t *parent,
+                                  const xiaozhi_home_screen_config_t *config,
+                                  xiaozhi_home_tile_t tile_id,
                                   const lv_image_dsc_t *icon,
                                   const char *text,
                                   lv_font_t *label_font,
@@ -91,6 +94,15 @@ static lv_obj_t *create_grid_item(lv_obj_t *parent,
     set_label_font(label_obj, label_font);
     lv_obj_align(label_obj, LV_ALIGN_TOP_MID, 0, label_y);
 
+    if (config->enable_tile_event && config->tile_event_cb)
+    {
+        lv_obj_add_flag(cell, LV_OBJ_FLAG_CLICKABLE);
+        lv_obj_add_event_cb(cell,
+                            config->tile_event_cb,
+                            LV_EVENT_CLICKED,
+                            (void *)(uintptr_t)tile_id);
+    }
+
     if (icon_out)
     {
         *icon_out = icon_obj;
@@ -111,6 +123,11 @@ rt_err_t xiaozhi_home_screen_create(const xiaozhi_home_screen_config_t *config,
         {"阅读", "宠物管理", "AI小豆"},
         {"时间管理", "天气", "日历日程"},
         {"录音", "音乐", "设置"},
+    };
+    static const xiaozhi_home_tile_t home_tiles[HOME_GRID_ROWS][HOME_GRID_COLS] = {
+        {XIAOZHI_HOME_TILE_READING, XIAOZHI_HOME_TILE_PET, XIAOZHI_HOME_TILE_AI},
+        {XIAOZHI_HOME_TILE_CLOCK, XIAOZHI_HOME_TILE_WEATHER, XIAOZHI_HOME_TILE_CALENDAR},
+        {XIAOZHI_HOME_TILE_RECORD, XIAOZHI_HOME_TILE_MUSIC, XIAOZHI_HOME_TILE_SETTINGS},
     };
     lv_coord_t screen_w;
     lv_coord_t screen_h;
@@ -270,6 +287,8 @@ rt_err_t xiaozhi_home_screen_create(const xiaozhi_home_screen_config_t *config,
             }
 
             cell = create_grid_item(screen,
+                                    config,
+                                    home_tiles[row][col],
                                     home_icons[row][col],
                                     home_labels[row][col],
                                     label_font,
@@ -298,6 +317,7 @@ rt_err_t xiaozhi_home_screen_create(const xiaozhi_home_screen_config_t *config,
     refs->last_time = NULL;
     refs->ui_Image_calendar = NULL;
     refs->ui_Label_year = NULL;
+    refs->ui_Label_lunar = NULL;
     refs->ui_Label_day = NULL;
     refs->ui_Label_second = NULL;
     refs->ui_Image_second = NULL;

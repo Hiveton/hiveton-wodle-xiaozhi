@@ -3255,4 +3255,3 @@ static rt_err_t lcd_ctrl(int argc, char **argv)
 }
 MSH_CMD_EXPORT(lcd_ctrl, lcd control);
 #endif /* RT_USING_FINSH */
-

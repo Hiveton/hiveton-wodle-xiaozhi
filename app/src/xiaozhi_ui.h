@@ -17,6 +17,7 @@ void xiaozhi_ui_chat_status(char *string);
 void xiaozhi_ui_chat_output(char *string);
 void xiaozhi_ui_standby_chat_output(char *string);
 void ui_swith_to_standby_screen(void);
+void ui_switch_to_home_screen(void);
 void ui_switch_to_xiaozhi_screen(void);
 void xiaozhi_ui_task(void *args);
 void ui_sleep_callback(lv_timer_t *timer);
